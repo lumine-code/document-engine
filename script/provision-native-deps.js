@@ -30,6 +30,7 @@ const wasmtimeRoot = path.join(
   dependencyRoot,
   `wasmtime-${manifest.wasmtime.version}-${platformKey}`,
 )
+const archiveExtractor = resolveArchiveExtractor()
 
 async function main() {
   fs.mkdirSync(cacheRoot, {recursive: true})
@@ -125,7 +126,7 @@ async function provision({
   fs.rmSync(staging, {recursive: true, force: true})
   fs.mkdirSync(staging, {recursive: true})
   const result = spawnSync(
-    'tar',
+    archiveExtractor,
     ['-xf', gypPath(archivePath), '-C', gypPath(staging)],
     {
       cwd: packageRoot,
@@ -174,6 +175,16 @@ function isProvisioned(destination, marker, sha256) {
   } catch {
     return false
   }
+}
+
+function resolveArchiveExtractor() {
+  if (process.platform !== 'win32') return 'tar'
+  const windowsRoot = process.env.SystemRoot ?? process.env.WINDIR
+  if (windowsRoot) {
+    const systemTar = path.join(windowsRoot, 'System32', 'tar.exe')
+    if (fs.existsSync(systemTar)) return systemTar
+  }
+  return 'tar'
 }
 
 async function download(url, destination) {
