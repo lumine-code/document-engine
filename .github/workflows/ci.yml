@@ -32,6 +32,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: lumine-code/superstring
+          ref: 894d5e9fd88ccb43a8b2fae661ea2998a7c09581
           path: superstring
       - uses: actions/setup-node@v7
         with:
@@ -77,61 +78,73 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: lumine-code/superstring
+          ref: 894d5e9fd88ccb43a8b2fae661ea2998a7c09581
           path: superstring
       - name: Check out Lumine facade sources
         uses: actions/checkout@v7
         with:
           repository: lumine-code/lumine
+          ref: 7deff3ba855447eb74a27be92dcfa15b21c0e8a2
           path: lumine
       - name: Check out Season grammar descriptor reader
         uses: actions/checkout@v7
         with:
           repository: lumine-code/season
+          ref: 14913f7d0c2cbc304fbcaf98a9ea0299c2b5166a
           path: season
       - name: Check out JavaScript grammar
         uses: actions/checkout@v7
         with:
           repository: lumine-code/language-javascript
+          ref: 9c5ecbcc3209ccb7a9323dca5274b6e34a1ab21f
           path: language-javascript
       - name: Check out Python grammar
         uses: actions/checkout@v7
         with:
           repository: lumine-code/language-python
+          ref: 8e432ec25a87334896cd3c25c5623a215ef6f2ea
           path: language-python
       - name: Check out IPython grammar
         uses: actions/checkout@v7
         with:
           repository: lumine-code/language-ipython
+          ref: 10ba0b63e7d5dc38d1ebd4259d0ddaf9f2bea11c
           path: language-ipython
       - name: Check out HTML grammar
         uses: actions/checkout@v7
         with:
           repository: lumine-code/language-html
+          ref: c652040181edd515f0a8ed28ab429edc9a0c219e
           path: language-html
       - name: Check out GFM grammar
         uses: actions/checkout@v7
         with:
           repository: lumine-code/language-gfm
+          ref: 77f885606ff649e41eb4704a7108ca8aa08e8880
           path: language-gfm
       - name: Check out Rust grammar
         uses: actions/checkout@v7
         with:
           repository: lumine-code/language-rust
+          ref: 51a7da57cb3db157b45028f6238195a7f5418ad9
           path: language-rust
       - name: Check out TODO grammar
         uses: actions/checkout@v7
         with:
           repository: lumine-code/language-todo
+          ref: dd2232e526f143942af8d1477f4b2dfca9fced5c
           path: language-todo
       - name: Check out TypeScript grammar
         uses: actions/checkout@v7
         with:
           repository: lumine-code/language-typescript
+          ref: 657786270ba63fb3dc44c5a53c23160f43a8f0af
           path: language-typescript
       - name: Check out Vue grammar
         uses: actions/checkout@v7
         with:
           repository: lumine-code/language-vue
+          ref: 11ea3ca490352c8416c8ca1136a664b147e4d40e
           path: language-vue
       - uses: actions/setup-node@v7
         with:
@@ -183,11 +196,13 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: lumine-code/superstring
+          ref: 894d5e9fd88ccb43a8b2fae661ea2998a7c09581
           path: superstring
       - name: Check out Lumine manifest and Electron runtime
         uses: actions/checkout@v7
         with:
           repository: lumine-code/lumine
+          ref: 7deff3ba855447eb74a27be92dcfa15b21c0e8a2
           path: lumine
       - uses: actions/setup-node@v7
         with:
@@ -224,46 +239,55 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: lumine-code/superstring
+          ref: 894d5e9fd88ccb43a8b2fae661ea2998a7c09581
           path: superstring
       - name: Check out Lumine facade sources
         uses: actions/checkout@v7
         with:
           repository: lumine-code/lumine
+          ref: 7deff3ba855447eb74a27be92dcfa15b21c0e8a2
           path: lumine
       - name: Check out JavaScript grammar
         uses: actions/checkout@v7
         with:
           repository: lumine-code/language-javascript
+          ref: 9c5ecbcc3209ccb7a9323dca5274b6e34a1ab21f
           path: language-javascript
       - name: Check out HTML grammar
         uses: actions/checkout@v7
         with:
           repository: lumine-code/language-html
+          ref: c652040181edd515f0a8ed28ab429edc9a0c219e
           path: language-html
       - name: Check out GFM grammar
         uses: actions/checkout@v7
         with:
           repository: lumine-code/language-gfm
+          ref: 77f885606ff649e41eb4704a7108ca8aa08e8880
           path: language-gfm
       - name: Check out TODO grammar
         uses: actions/checkout@v7
         with:
           repository: lumine-code/language-todo
+          ref: dd2232e526f143942af8d1477f4b2dfca9fced5c
           path: language-todo
       - name: Check out Python grammar
         uses: actions/checkout@v7
         with:
           repository: lumine-code/language-python
+          ref: 8e432ec25a87334896cd3c25c5623a215ef6f2ea
           path: language-python
       - name: Check out IPython grammar
         uses: actions/checkout@v7
         with:
           repository: lumine-code/language-ipython
+          ref: 10ba0b63e7d5dc38d1ebd4259d0ddaf9f2bea11c
           path: language-ipython
       - name: Check out TypeScript grammar
         uses: actions/checkout@v7
         with:
           repository: lumine-code/language-typescript
+          ref: 657786270ba63fb3dc44c5a53c23160f43a8f0af
           path: language-typescript
       - uses: actions/setup-node@v7
         with:
@@ -316,21 +340,25 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: lumine-code/superstring
+          ref: 894d5e9fd88ccb43a8b2fae661ea2998a7c09581
           path: superstring
       - name: Check out Lumine facade sources
         uses: actions/checkout@v7
         with:
           repository: lumine-code/lumine
+          ref: 7deff3ba855447eb74a27be92dcfa15b21c0e8a2
           path: lumine
       - name: Check out Season grammar descriptor reader
         uses: actions/checkout@v7
         with:
           repository: lumine-code/season
+          ref: 14913f7d0c2cbc304fbcaf98a9ea0299c2b5166a
           path: season
       - name: Check out package catalog
         uses: actions/checkout@v7
         with:
           repository: lumine-code/packages
+          ref: 1cb968c1bf312b88ff79baebfdc64a6597133a5c
           path: packages
       - uses: actions/setup-node@v7
         with:

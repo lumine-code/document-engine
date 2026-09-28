@@ -64,17 +64,21 @@ async function main() {
 
   switch (process.argv[2]) {
     case '--print-tree-sitter-root':
-      process.stdout.write(treeSitterRoot)
+      process.stdout.write(gypPath(treeSitterRoot))
       break
     case '--print-wasmtime-root':
       process.stdout.write(wasmtimeRoot)
       break
     case '--print-pcre2-root':
-      process.stdout.write(pcre2Root)
+      process.stdout.write(gypPath(pcre2Root))
       break
     default:
       break
   }
+}
+
+function gypPath(directory) {
+  return path.relative(packageRoot, directory).replaceAll(path.sep, '/')
 }
 
 function provisionPcreHeaders() {
