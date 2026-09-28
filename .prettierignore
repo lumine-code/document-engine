@@ -1,0 +1,3 @@
+.native-deps/
+build/
+node_modules/

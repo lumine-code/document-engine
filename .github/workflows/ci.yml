@@ -1,0 +1,363 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+  schedule:
+    - cron: '17 3 * * 2'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Node 24 on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Check out document-engine
+        uses: actions/checkout@v7
+        with:
+          path: document-engine
+      - name: Check out Superstring ABI producer
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/superstring
+          path: superstring
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            document-engine/package-lock.json
+            superstring/package-lock.json
+      - name: Build Superstring
+        working-directory: superstring
+        run: npm ci --ignore-scripts && npm run build:node
+      - name: Install document-engine
+        working-directory: document-engine
+        run: npm ci
+        env:
+          SUPERSTRING_SOURCE_PATH: ../superstring
+      - name: Run unit tests
+        working-directory: document-engine
+        run: npm test
+        env:
+          SUPERSTRING_PATH: ../superstring
+      - name: Lint JavaScript
+        working-directory: document-engine
+        run: npm run lint
+      - name: Check formatting
+        working-directory: document-engine
+        run: npm run format:check
+      - name: Verify package and ABI boundary
+        working-directory: document-engine
+        run: npm run check:package
+        env:
+          SUPERSTRING_SOURCE_PATH: ../superstring
+
+  integration:
+    name: Representative flat-workspace integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out document-engine
+        uses: actions/checkout@v7
+        with:
+          path: document-engine
+      - name: Check out Superstring
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/superstring
+          path: superstring
+      - name: Check out Lumine facade sources
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/lumine
+          path: lumine
+      - name: Check out Season grammar descriptor reader
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/season
+          path: season
+      - name: Check out JavaScript grammar
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/language-javascript
+          path: language-javascript
+      - name: Check out Python grammar
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/language-python
+          path: language-python
+      - name: Check out IPython grammar
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/language-ipython
+          path: language-ipython
+      - name: Check out HTML grammar
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/language-html
+          path: language-html
+      - name: Check out GFM grammar
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/language-gfm
+          path: language-gfm
+      - name: Check out Rust grammar
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/language-rust
+          path: language-rust
+      - name: Check out TODO grammar
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/language-todo
+          path: language-todo
+      - name: Check out TypeScript grammar
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/language-typescript
+          path: language-typescript
+      - name: Check out Vue grammar
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/language-vue
+          path: language-vue
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Build Superstring
+        working-directory: superstring
+        run: npm ci --ignore-scripts && npm run build:node
+      - name: Install Lumine JavaScript dependencies for production-facade integration
+        working-directory: lumine
+        shell: bash
+        run: |
+          npm ci --ignore-scripts
+          rm -rf node_modules/@lumine-code/superstring
+          ln -s ../../../superstring node_modules/@lumine-code/superstring
+      - name: Install grammar descriptor reader dependencies
+        working-directory: season
+        run: npm ci --ignore-scripts
+      - name: Install document-engine
+        working-directory: document-engine
+        run: npm ci
+        env:
+          SUPERSTRING_SOURCE_PATH: ../superstring
+      - name: Run representative integration tests
+        working-directory: document-engine
+        env:
+          SUPERSTRING_PATH: ../superstring
+        run: npm run test:integration
+      - name: Run unit and differential display tests with the Lumine oracle
+        working-directory: document-engine
+        env:
+          SUPERSTRING_PATH: ../superstring
+        run: npm test
+      - name: Smoke every checked-out grammar and differentially verify the representative set
+        working-directory: document-engine
+        env:
+          SUPERSTRING_PATH: ../superstring
+        run: npm run test:query-fleet
+
+  electron-abi:
+    name: Lumine Electron ABI smoke on Linux x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out document-engine
+        uses: actions/checkout@v7
+        with:
+          path: document-engine
+      - name: Check out Superstring
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/superstring
+          path: superstring
+      - name: Check out Lumine manifest and Electron runtime
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/lumine
+          path: lumine
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          (cd superstring && npm ci --ignore-scripts)
+          (cd document-engine && npm ci --ignore-scripts)
+          (cd lumine && npm ci --ignore-scripts && node node_modules/electron/install.js)
+      - name: Build both addons for Lumine Electron
+        shell: bash
+        run: |
+          ELECTRON_VERSION="$(node -p "require('./lumine/package.json').electronVersion")"
+          export npm_config_runtime=electron
+          export npm_config_target="$ELECTRON_VERSION"
+          export npm_config_dist_url=https://electronjs.org/headers
+          (cd superstring && npm run build:node)
+          (cd document-engine && SUPERSTRING_SOURCE_PATH=../superstring npm run build)
+      - name: Exercise SnapshotLease, DocumentSession and DisplayView in Electron
+        working-directory: document-engine
+        run: xvfb-run -a ../lumine/node_modules/.bin/electron --no-sandbox script/electron-smoke.js
+
+  sanitizers:
+    name: ASan and UBSan on Linux x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out document-engine
+        uses: actions/checkout@v7
+        with:
+          path: document-engine
+      - name: Check out Superstring
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/superstring
+          path: superstring
+      - name: Check out Lumine facade sources
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/lumine
+          path: lumine
+      - name: Check out JavaScript grammar
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/language-javascript
+          path: language-javascript
+      - name: Check out HTML grammar
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/language-html
+          path: language-html
+      - name: Check out GFM grammar
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/language-gfm
+          path: language-gfm
+      - name: Check out TODO grammar
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/language-todo
+          path: language-todo
+      - name: Check out Python grammar
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/language-python
+          path: language-python
+      - name: Check out IPython grammar
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/language-ipython
+          path: language-ipython
+      - name: Check out TypeScript grammar
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/language-typescript
+          path: language-typescript
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Build sanitized Superstring
+        working-directory: superstring
+        run: npm ci --ignore-scripts && npm run build:node
+        env:
+          CFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+          CXXFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+          LDFLAGS: -fsanitize=address,undefined
+      - name: Install Lumine JavaScript dependencies for sanitizer integration
+        working-directory: lumine
+        shell: bash
+        run: |
+          npm ci --ignore-scripts
+          rm -rf node_modules/@lumine-code/superstring
+          ln -s ../../../superstring node_modules/@lumine-code/superstring
+      - name: Build sanitized document-engine
+        working-directory: document-engine
+        run: npm ci
+        env:
+          SUPERSTRING_SOURCE_PATH: ../superstring
+          CFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+          CXXFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+          LDFLAGS: -fsanitize=address,undefined
+      - name: Run native suites under sanitizers
+        working-directory: document-engine
+        shell: bash
+        run: |
+          export LD_PRELOAD="$(gcc -print-file-name=libasan.so)"
+          npm test
+          npm run test:integration
+        env:
+          SUPERSTRING_PATH: ../superstring
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=0:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+
+  full-fleet:
+    name: Full catalog grammar/query smoke
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out document-engine
+        uses: actions/checkout@v7
+        with:
+          path: document-engine
+      - name: Check out Superstring
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/superstring
+          path: superstring
+      - name: Check out Lumine facade sources
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/lumine
+          path: lumine
+      - name: Check out Season grammar descriptor reader
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/season
+          path: season
+      - name: Check out package catalog
+        uses: actions/checkout@v7
+        with:
+          repository: lumine-code/packages
+          path: packages
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Check out every language repository at its catalog SHA
+        working-directory: document-engine
+        run: node script/checkout-language-fleet.js ../packages/index.json
+      - name: Build Superstring
+        working-directory: superstring
+        run: npm ci --ignore-scripts && npm run build:node
+      - name: Install Lumine JavaScript dependencies
+        working-directory: lumine
+        shell: bash
+        run: |
+          npm ci --ignore-scripts
+          rm -rf node_modules/@lumine-code/superstring
+          ln -s ../../../superstring node_modules/@lumine-code/superstring
+      - name: Install grammar descriptor reader dependencies
+        working-directory: season
+        run: npm ci --ignore-scripts
+      - name: Install document-engine
+        working-directory: document-engine
+        run: npm ci
+        env:
+          SUPERSTRING_SOURCE_PATH: ../superstring
+      - name: Compile and execute the complete native query fleet
+        working-directory: document-engine
+        env:
+          SUPERSTRING_PATH: ../superstring
+        run: npm run test:query-fleet

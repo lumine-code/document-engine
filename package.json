@@ -1,0 +1,62 @@
+{
+  "name": "@lumine-code/document-engine",
+  "author": "lumine-code",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Builds native syntax and display state for editor documents.",
+  "main": "lib/main.js",
+  "types": "lib/main.d.ts",
+  "files": [
+    "binding.gyp",
+    "docs",
+    "lib",
+    "script",
+    "src",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node script/provision-native-deps.js && node-gyp rebuild",
+    "benchmark:display": "node script/benchmark-display-index.js",
+    "benchmark:queries": "node script/benchmark-query-locality.js",
+    "check:abi": "node script/resolve-superstring-abi.js --check",
+    "check:package": "node script/check-package.js",
+    "check:release": "node script/check-package.js --release",
+    "lint": "eslint . --max-warnings 0",
+    "format": "prettier . --write",
+    "format:check": "prettier . --check",
+    "install": "node script/provision-native-deps.js && node-gyp rebuild && node script/cleanup-install-artifacts.js",
+    "test": "node --test --test-concurrency=1 test/*.test.js",
+    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.js",
+    "test:query-fleet": "node script/check-native-query-fleet.js",
+    "check": "npm run lint && npm run format:check && npm run build && npm test && npm run check:package"
+  },
+  "repository": "https://github.com/lumine-code/document-engine",
+  "bugs": "https://github.com/lumine-code/document-engine/issues",
+  "homepage": "https://github.com/lumine-code/document-engine",
+  "keywords": [
+    "text-buffer",
+    "tree-sitter",
+    "wasm",
+    "rendering",
+    "native"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@lumine-code/superstring": "github:lumine-code/superstring#894d5e9fd88ccb43a8b2fae661ea2998a7c09581",
+    "node-addon-api": "^8.9.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.11.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.12.0",
+    "prettier": "^3.9.9",
+    "web-tree-sitter": "0.27.0"
+  }
+}
