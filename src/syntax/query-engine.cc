@@ -102,12 +102,6 @@ std::filesystem::path path_from_utf8(const std::string &value) {
   return std::filesystem::path(encoded);
 }
 
-std::string path_key(const std::filesystem::path &value) {
-  const std::u8string encoded = value.generic_u8string();
-  return std::string(reinterpret_cast<const char *>(encoded.data()),
-                     encoded.size());
-}
-
 bool read_text_file(const std::string &path, std::string &contents,
                     QueryErrorInfo &error) {
   std::ifstream stream(path_from_utf8(path), std::ios::binary | std::ios::ate);

@@ -48,7 +48,7 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@lumine-code/superstring": "github:lumine-code/superstring#894d5e9fd88ccb43a8b2fae661ea2998a7c09581",
+    "@lumine-code/superstring": "github:lumine-code/superstring#fc34081b5666177cd5bba06da785e263e5d15bae",
     "node-addon-api": "^8.9.2"
   },
   "devDependencies": {

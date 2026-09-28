@@ -186,9 +186,13 @@ language_exports_in_wasm(const std::vector<char> &bytes) {
 std::string grammar_fingerprint(const std::filesystem::path &path,
                                 uintmax_t size,
                                 std::filesystem::file_time_type modified_at) {
+  const auto modified_at_nanoseconds =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          modified_at.time_since_epoch())
+          .count();
   std::ostringstream output;
   output << path_key(path) << '\n' << size << '\n'
-         << modified_at.time_since_epoch().count();
+         << modified_at_nanoseconds;
   return output.str();
 }
 

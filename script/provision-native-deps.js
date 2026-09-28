@@ -124,10 +124,15 @@ async function provision({
   const staging = `${destination}.extracting-${process.pid}`
   fs.rmSync(staging, {recursive: true, force: true})
   fs.mkdirSync(staging, {recursive: true})
-  const result = spawnSync('tar', ['-xf', archivePath, '-C', staging], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  const result = spawnSync(
+    'tar',
+    ['-xf', gypPath(archivePath), '-C', gypPath(staging)],
+    {
+      cwd: packageRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  )
   if (result.error || result.status !== 0) {
     fs.rmSync(staging, {recursive: true, force: true})
     throw new Error(
