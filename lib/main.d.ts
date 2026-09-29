@@ -152,6 +152,7 @@ export interface InjectionRevisionTags {
 
 export interface InjectionRegistrationManifest {
   injectionPointGeneration: number
+  injectionRescanWave?: number
   grammars: Array<{
     grammarId: string
     types: string[]
@@ -174,6 +175,8 @@ export interface InjectionCandidateBatch extends InjectionRevisionTags {
   candidateScanMilliseconds: number
   candidatePackMilliseconds: number
   unresolvedQueryLanguages?: string[]
+  sourceTokenFingerprint?: string
+  scannedSourceCount?: number
 }
 
 export interface InjectionNode {
@@ -248,6 +251,13 @@ export interface DocumentSessionDiagnostics {
   injectionStaleRequests: number
   injectionAbortedRequests: number
   injectionPublishedGeneration: number
+  injectionTopologyGeneration: number
+  injectionReusedLayers: number
+  injectionProjectedRanges: number
+  injectionChildIncrementalParses: number
+  injectionChildFullParses: number
+  injectionReuseFallbacks: number
+  injectionChildBackendCount: number
   syntaxInputTooLarge: number
   syntaxFailOpenCount: number
   [name: string]: number | string | boolean
@@ -504,7 +514,7 @@ export declare class DocumentSession {
     request: InjectionRevisionTags & InjectionRegistrationManifest,
   ): Promise<InjectionCandidateBatch>
   resolveInjectionNode(
-    candidate: {candidateId: number; nodeHandle?: number},
+    candidate: {requestId: number; candidateId: number; nodeHandle?: number},
     tags: InjectionRevisionTags,
   ): InjectionNode
   resolveQueryNode(

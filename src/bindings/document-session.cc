@@ -448,6 +448,8 @@ public:
           state_->injection_engine->publish_root(
               state_->published_syntax, state_->query_snapshot,
               *state_->syntax_analysis, state_->language_id,
+              state_->edits_since_syntax, syntax_result_.incremental,
+              state_->active_injection_jobs == 0,
               state_->syntax_lease);
           state_->query_compile_milliseconds =
               syntax_result_.query_statistics.compile_milliseconds;
@@ -2574,6 +2576,19 @@ Napi::Value DocumentSessionWrapper::get_diagnostics(
              Napi::Number::New(env, injections.published_generation));
   result.Set("injectionTopologyGeneration",
              Napi::Number::New(env, injections.topology_generation));
+  result.Set("injectionReusedLayers",
+             Napi::Number::New(env, injections.reused_layer_count));
+  result.Set("injectionProjectedRanges",
+             Napi::Number::New(env, injections.projected_range_count));
+  result.Set("injectionChildIncrementalParses",
+             Napi::Number::New(
+                 env, injections.child_incremental_parse_count));
+  result.Set("injectionChildFullParses",
+             Napi::Number::New(env, injections.child_full_parse_count));
+  result.Set("injectionReuseFallbacks",
+             Napi::Number::New(env, injections.reuse_fallback_count));
+  result.Set("injectionChildBackendCount",
+             Napi::Number::New(env, injections.child_backend_count));
   const HighlightIndexDiagnostics highlights =
       state_->highlight_index->diagnostics();
   result.Set("highlightGeneration",

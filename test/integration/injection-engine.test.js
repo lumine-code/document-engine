@@ -315,14 +315,16 @@ test('deduplicates handle caches when candidate scans race', async () => {
   const batches = await Promise.all(
     Array.from({length: 4}, () => session.getInjectionCandidates(request)),
   )
-  for (const batch of batches) {
-    assert.equal(decodeCandidates(batch).length, declarationCount)
-    session.abortInjectionRequest({
-      ...tags,
-      requestId: batch.requestId,
-      reason: 'test-complete',
-    })
-  }
+  const accepted = batches.filter((batch) => batch.accepted)
+  assert.equal(accepted.length, 1)
+  assert.equal(decodeCandidates(accepted[0]).length, declarationCount)
+  for (const batch of batches.filter((candidate) => !candidate.accepted))
+    assert.equal(batch.reason, 'stale-candidates')
+  session.abortInjectionRequest({
+    ...tags,
+    requestId: accepted[0].requestId,
+    reason: 'test-complete',
+  })
 
   const cached = await session.getInjectionCandidates(request)
   assert.equal(decodeCandidates(cached).length, declarationCount)
@@ -429,7 +431,7 @@ test('publishes query-defined injection ranges without a JS callback round trip'
 
 test('parses HTML to JavaScript to TODO as nested native child layers', async () => {
   const buffer = new TextBuffer(
-    '<script>const value = 1 // TODO nested\n</script>\n',
+    '<div>a</div>\n<script>const value = 1 // TODO nested\n</script>\n',
   )
   const session = new DocumentSession()
   const html = new FakeGrammar(
@@ -477,6 +479,21 @@ test('parses HTML to JavaScript to TODO as nested native child layers', async ()
   assert.equal(diagnostics.parsedInjectionLayerCount, 2)
   assert.equal(diagnostics.failedInjectionLayerCount, 0)
   assert.equal(diagnostics.maximumInjectionDepth, 2)
+
+  buffer.setTextInRange(
+    {start: {row: 0, column: 5}, end: {row: 0, column: 6}},
+    'b',
+  )
+  await apply(session, buffer, 2, new Uint32Array([0, 5, 0, 6, 0, 5, 0, 6]))
+  const incremental = await bridge.synchronize()
+  assert.equal(incremental.accepted, true)
+  const afterEdit = session.getDiagnostics()
+  assert.equal(afterEdit.dynamicInjectionLayerCount, 2)
+  assert.equal(afterEdit.parsedInjectionLayerCount, 2)
+  assert.equal(afterEdit.failedInjectionLayerCount, 0)
+  assert.equal(afterEdit.maximumInjectionDepth, 2)
+  assert.ok(afterEdit.injectionReusedLayers >= 2)
+  assert.ok(afterEdit.injectionChildIncrementalParses >= 2)
 
   bridge.destroy()
   await session.destroy()

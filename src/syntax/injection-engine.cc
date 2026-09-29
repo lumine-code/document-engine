@@ -319,6 +319,7 @@ struct NodeRangeSpec {
 
 struct QueryInjectionProposal {
   uint32_t candidate_id = 0;
+  uint32_t pattern_index = UINT32_MAX;
   std::string parent_grammar_id;
   std::string language_name;
   bool target_self = false;
@@ -336,6 +337,7 @@ struct InjectionCandidateRecord {
   std::string grammar_id;
   std::string type;
   uint64_t parent_layer_id = 0;
+  uint64_t parent_reuse_slot_id = 0;
   uint32_t depth = 0;
 };
 
@@ -343,23 +345,77 @@ struct PendingScopeTarget {
   size_t layer_index = 0;
 };
 
+struct ProjectedInjectionLayer {
+  const InjectionLayerRecord *source = nullptr;
+  std::vector<InjectionRangeRecord> ranges;
+  bool projectable = false;
+};
+
+struct InjectionReuseState {
+  InjectionRevisionTags target_tags;
+  std::shared_ptr<const InjectionRangeIndex> previous_index;
+  std::vector<RevisionEditBatch> projection;
+  std::vector<SyntaxEdit> syntax_edits;
+  std::vector<ProjectedInjectionLayer> layers;
+  bool eligible = false;
+  bool generation_compatible = true;
+  bool same_extent_edits = false;
+};
+
+struct InjectionSourceToken {
+  uint64_t reuse_slot_id = 0;
+  uint64_t syntax_identity = 0;
+  uint64_t registration_fingerprint = 0;
+
+  bool operator<(const InjectionSourceToken &other) const {
+    return std::tie(reuse_slot_id, syntax_identity,
+                    registration_fingerprint) <
+           std::tie(other.reuse_slot_id, other.syntax_identity,
+                    other.registration_fingerprint);
+  }
+};
+
+std::string source_token_fingerprint(
+    const std::set<InjectionSourceToken> &tokens) {
+  constexpr uint64_t offset_basis = UINT64_C(14695981039346656037);
+  constexpr uint64_t prime = UINT64_C(1099511628211);
+  uint64_t fingerprint = offset_basis;
+  for (const InjectionSourceToken &token : tokens) {
+    const uint64_t values[] = {token.reuse_slot_id, token.syntax_identity,
+                               token.registration_fingerprint};
+    for (uint64_t value : values) {
+      for (uint32_t byte = 0; byte < sizeof(value); byte++) {
+        fingerprint ^= static_cast<unsigned char>(value >> (byte * 8));
+        fingerprint *= prime;
+      }
+    }
+  }
+  return std::to_string(fingerprint);
+}
+
 struct InjectionRequestState {
   uint64_t request_id = 0;
+  uint64_t candidate_epoch = 0;
+  uint32_t rescan_wave = 0;
   InjectionRevisionTags tags;
   uint64_t injection_point_generation = 0;
   uint32_t next_batch_index = 0;
   bool final_received = false;
   bool awaiting_language_scopes = false;
   bool child_parse_active = false;
+  std::shared_ptr<InjectionReuseState> reuse;
   std::unordered_map<uint32_t, InjectionCandidateRecord> candidates;
   std::unordered_set<uint32_t> valid_candidate_ids;
   std::shared_ptr<InjectionRangeIndex> staged_index;
+  std::map<std::string, uint64_t> registration_fingerprints;
+  std::set<InjectionSourceToken> scanned_source_tokens;
   std::map<std::pair<uint32_t, uint32_t>, PendingScopeTarget> scope_targets;
 };
 
 struct GrammarManifestEntry {
   std::string grammar_id;
   std::vector<std::string> types;
+  uint64_t registration_fingerprint = 0;
 };
 
 struct CandidateScanItem {
@@ -368,6 +424,7 @@ struct CandidateScanItem {
   std::string type;
   uint32_t node_handle = 0;
   uint64_t parent_layer_id = 0;
+  uint64_t parent_reuse_slot_id = 0;
   uint32_t depth = 0;
   uint32_t start_byte = 0;
   uint32_t end_byte = 0;
@@ -377,8 +434,11 @@ struct CandidateSource {
   std::shared_ptr<const PublishedSyntaxSnapshot> syntax;
   std::string grammar_id;
   uint64_t layer_id = 0;
+  uint64_t reuse_slot_id = 0;
   uint32_t depth = 0;
 };
+
+constexpr uint32_t MAX_INJECTION_RESCAN_WAVES = 32;
 
 struct ParsedGrammarDescriptor {
   std::string language_id;
@@ -415,6 +475,12 @@ void merge_adjacent_whitespace(std::vector<InjectionRangeRecord> &ranges,
 std::vector<std::string> parse_scopes(Napi::Value value);
 void finalize_index_counts(InjectionRangeIndex &index);
 bool query_layer_is_resolved(const InjectionLayerRecord &layer);
+std::shared_ptr<InjectionReuseState> build_reuse_state(
+    const std::shared_ptr<const InjectionRangeIndex> &previous,
+    const std::vector<RevisionEditBatch> &projection,
+    bool root_incremental, const InjectionRevisionTags &target_tags,
+    const SnapshotAnalysis &analysis, bool same_root_grammar,
+    bool injection_workers_idle);
 
 } // namespace
 
@@ -426,8 +492,11 @@ struct InjectionEngine::Impl {
   std::vector<QueryInjectionProposal> query_proposals;
   std::unordered_map<uint64_t, InjectionRequestState> requests;
   std::shared_ptr<const InjectionRangeIndex> published_index;
+  std::shared_ptr<InjectionReuseState> reuse_state;
   uint64_t next_request_id = 1;
+  uint64_t candidate_epoch = 0;
   uint64_t next_layer_id = 1;
+  uint64_t next_reuse_slot_id = 1;
   uint64_t candidate_count = 0;
   uint64_t stale_request_count = 0;
   uint64_t aborted_request_count = 0;
@@ -435,12 +504,18 @@ struct InjectionEngine::Impl {
   uint64_t topology_generation = 0;
   uint64_t query_language_resolution_count = 0;
   uint64_t query_language_rejection_count = 0;
+  uint64_t reused_layer_count = 0;
+  uint64_t projected_range_count = 0;
+  uint64_t child_incremental_parse_count = 0;
+  uint64_t child_full_parse_count = 0;
+  uint64_t reuse_fallback_count = 0;
   // Keep the last finalized layer count across publish_root's query-only
   // staging index so the bridge can distinguish stable zero from a removal.
   uint64_t published_layer_count = 0;
   std::unordered_map<uint64_t, std::shared_ptr<SyntaxBackend>> child_backends;
   std::unordered_map<std::string, ParsedGrammarDescriptor> query_grammars;
   std::unordered_set<std::string> query_rejected_aliases;
+  std::set<InjectionSourceToken> seen_source_tokens;
 };
 
 namespace {
@@ -472,13 +547,17 @@ public:
       InjectionEngine *engine,
       std::vector<CandidateSource> sources,
       std::vector<GrammarManifestEntry> manifest,
+      std::set<InjectionSourceToken> seen_source_tokens,
       InjectionRevisionTags tags, uint64_t injection_point_generation,
+      uint32_t rescan_wave, uint64_t candidate_epoch,
       std::shared_ptr<NativeJobControl> job)
       : Napi::AsyncWorker(env, "DocumentSession.getInjectionCandidates"),
         deferred_(Napi::Promise::Deferred::New(env)),
         session_(std::move(session)), engine_(engine),
-        sources_(std::move(sources)), manifest_(std::move(manifest)), tags_(tags),
+        sources_(std::move(sources)), manifest_(std::move(manifest)),
+        seen_source_tokens_(std::move(seen_source_tokens)), tags_(tags),
         injection_point_generation_(injection_point_generation),
+        rescan_wave_(rescan_wave), candidate_epoch_(candidate_epoch),
         cancellation_{session_.get(), tags}, job_(std::move(job)),
         queued_at_(InjectionClock::now()) {}
 
@@ -498,12 +577,21 @@ public:
                               .count();
     for (const CandidateSource &source : sources_) {
       std::set<std::string> requested_types;
+      uint64_t registration_fingerprint = 0;
       for (const GrammarManifestEntry &entry : manifest_) {
-        if (entry.grammar_id == source.grammar_id)
+        if (entry.grammar_id == source.grammar_id) {
           requested_types.insert(entry.types.begin(), entry.types.end());
+          registration_fingerprint = entry.registration_fingerprint;
+        }
       }
       if (requested_types.empty())
         continue;
+      const InjectionSourceToken token{
+          source.reuse_slot_id, source.syntax->identity(),
+          registration_fingerprint};
+      if (seen_source_tokens_.contains(token))
+        continue;
+      scanned_source_tokens_.insert(token);
       std::map<std::string, std::vector<uint32_t>> handles;
       if (!source.syntax->collect_handles_for_types(
               requested_types, handles, candidate_scan_cancelled,
@@ -520,6 +608,7 @@ public:
           const TSNode node = source.syntax->node(handle);
           items_.push_back(CandidateScanItem{source.syntax, source.grammar_id,
                                               type, handle, source.layer_id,
+                                              source.reuse_slot_id,
                                               source.depth,
                                               ts_node_start_byte(node),
                                               ts_node_end_byte(node)});
@@ -561,19 +650,48 @@ public:
     }
 
     InjectionEngine::Impl &impl = *engine_->impl_;
-    if (!impl.requests.empty()) {
-      impl.stale_request_count += impl.requests.size();
-      impl.requests.clear();
+    if (candidate_epoch_ != impl.candidate_epoch) {
+      impl.stale_request_count++;
+      deferred_.Resolve(stale_result(env, tags_, "stale-candidates"));
+      lock.unlock();
+      finish_injection_job(env, session_);
+      return;
     }
     const uint64_t request_id = impl.next_request_id++;
     InjectionRequestState request;
     request.request_id = request_id;
+    request.candidate_epoch = candidate_epoch_;
+    request.rescan_wave = rescan_wave_;
     request.tags = tags_;
     request.injection_point_generation = injection_point_generation_;
+    if (impl.reuse_state &&
+        tags_equal(impl.reuse_state->target_tags, tags_)) {
+      request.reuse = impl.reuse_state;
+      if (request.reuse->previous_index &&
+          request.reuse->previous_index->injection_point_generation !=
+              injection_point_generation_) {
+        request.reuse->generation_compatible = false;
+      }
+    }
+    request.scanned_source_tokens = scanned_source_tokens_;
+    for (const GrammarManifestEntry &entry : manifest_) {
+      request.registration_fingerprints[entry.grammar_id] =
+          entry.registration_fingerprint;
+    }
+    if (rescan_wave_ == 0)
+      impl.seen_source_tokens.clear();
+    const bool same_revision_wave =
+        rescan_wave_ > 0 &&
+        impl.published_index && tags_equal(impl.published_index->tags, tags_) &&
+        impl.published_index->injection_point_generation ==
+            injection_point_generation_ &&
+        !impl.seen_source_tokens.empty();
+    impl.seen_source_tokens.insert(scanned_source_tokens_.begin(),
+                                   scanned_source_tokens_.end());
     request.staged_index = std::make_shared<InjectionRangeIndex>();
     if (impl.published_index) {
       for (const InjectionLayerRecord &layer : impl.published_index->layers) {
-        if (layer.query_defined)
+        if (same_revision_wave || layer.query_defined)
           request.staged_index->layers.push_back(layer);
       }
       finalize_index_counts(*request.staged_index);
@@ -616,6 +734,7 @@ public:
                                       item.grammar_id,
                                       item.type,
                                       item.parent_layer_id,
+                                      item.parent_reuse_slot_id,
                                       item.depth};
       request.candidates.emplace(candidate_id, std::move(record));
       request.valid_candidate_ids.insert(candidate_id);
@@ -668,6 +787,11 @@ public:
     response.Set("candidatePackMilliseconds",
                  Napi::Number::New(
                      env, elapsed_milliseconds(pack_started_at)));
+    response.Set("sourceTokenFingerprint",
+                 Napi::String::New(
+                     env, source_token_fingerprint(impl.seen_source_tokens)));
+    response.Set("scannedSourceCount",
+                 Napi::Number::New(env, scanned_source_tokens_.size()));
     deferred_.Resolve(response);
     lock.unlock();
     finish_injection_job(env, session_);
@@ -686,8 +810,12 @@ private:
   InjectionEngine *engine_ = nullptr;
   std::vector<CandidateSource> sources_;
   std::vector<GrammarManifestEntry> manifest_;
+  std::set<InjectionSourceToken> seen_source_tokens_;
+  std::set<InjectionSourceToken> scanned_source_tokens_;
   InjectionRevisionTags tags_;
   uint64_t injection_point_generation_ = 0;
+  uint32_t rescan_wave_ = 0;
+  uint64_t candidate_epoch_ = 0;
   std::vector<CandidateScanItem> items_;
   bool cancelled_ = false;
   CandidateCancellation cancellation_;
@@ -718,6 +846,302 @@ void finalize_index_counts(InjectionRangeIndex &index) {
       index.failed_child_layer_count++;
     index.maximum_depth = std::max<uint64_t>(index.maximum_depth, layer.depth);
   }
+}
+
+std::vector<SyntaxEdit>
+syntax_edits_for_projection(const std::vector<RevisionEditBatch> &projection) {
+  std::vector<SyntaxEdit> edits;
+  for (const RevisionEditBatch &batch : projection) {
+    edits.reserve(edits.size() + batch.edits.size() / 8);
+    for (size_t index = 0; index + 7 < batch.edits.size(); index += 8) {
+      edits.push_back(SyntaxEdit{
+          Point{batch.edits[index], batch.edits[index + 1]},
+          Point{batch.edits[index + 2], batch.edits[index + 3]},
+          Point{batch.edits[index + 4], batch.edits[index + 5]},
+          Point{batch.edits[index + 6], batch.edits[index + 7]}});
+    }
+  }
+  return edits;
+}
+
+bool projection_has_same_extents(
+    const std::vector<RevisionEditBatch> &projection) {
+  for (const RevisionEditBatch &batch : projection) {
+    if (!batch.before || !batch.after || batch.edits.size() % 8 != 0)
+      return false;
+    for (size_t index = 0; index < batch.edits.size(); index += 8) {
+      const uint64_t old_start = analysis_offset_for_point(
+          *batch.before,
+          Point{batch.edits[index], batch.edits[index + 1]});
+      const uint64_t old_end = analysis_offset_for_point(
+          *batch.before,
+          Point{batch.edits[index + 2], batch.edits[index + 3]});
+      const uint64_t new_start = analysis_offset_for_point(
+          *batch.after,
+          Point{batch.edits[index + 4], batch.edits[index + 5]});
+      const uint64_t new_end = analysis_offset_for_point(
+          *batch.after,
+          Point{batch.edits[index + 6], batch.edits[index + 7]});
+      if (old_end - old_start != new_end - new_start)
+        return false;
+    }
+  }
+  return true;
+}
+
+bool continuous_projection(const InjectionRangeIndex &previous,
+                           const std::vector<RevisionEditBatch> &projection,
+                           const InjectionRevisionTags &target_tags) {
+  if (previous.tags.buffer_revision + 1 != target_tags.buffer_revision ||
+      previous.tags.syntax_revision != previous.tags.buffer_revision ||
+      target_tags.syntax_revision != target_tags.buffer_revision)
+    return false;
+  if (projection.empty())
+    return true;
+  uint64_t revision = previous.tags.buffer_revision;
+  for (const RevisionEditBatch &batch : projection) {
+    if (batch.from_revision != revision ||
+        batch.to_revision != batch.from_revision + 1 || !batch.before ||
+        !batch.after || batch.edits.size() % 8 != 0)
+      return false;
+    revision = batch.to_revision;
+  }
+  return revision == target_tags.buffer_revision;
+}
+
+std::shared_ptr<InjectionReuseState> build_reuse_state(
+    const std::shared_ptr<const InjectionRangeIndex> &previous,
+    const std::vector<RevisionEditBatch> &projection,
+    bool root_incremental, const InjectionRevisionTags &target_tags,
+    const SnapshotAnalysis &analysis, bool same_root_grammar,
+    bool injection_workers_idle) {
+  if (!previous)
+    return nullptr;
+  auto state = std::make_shared<InjectionReuseState>();
+  state->target_tags = target_tags;
+  state->previous_index = previous;
+  state->projection = projection;
+  state->eligible =
+      root_incremental && injection_workers_idle && same_root_grammar &&
+      previous->tags.language_generation == target_tags.language_generation &&
+      continuous_projection(*previous, projection, target_tags);
+  if (!state->eligible)
+    return state;
+  state->syntax_edits = syntax_edits_for_projection(projection);
+  state->same_extent_edits = projection_has_same_extents(projection);
+  state->layers.reserve(previous->layers.size());
+  for (const InjectionLayerRecord &layer : previous->layers) {
+    ProjectedInjectionLayer projected;
+    projected.source = &layer;
+    projected.projectable = true;
+    projected.ranges.reserve(layer.ranges.size());
+    for (const InjectionRangeRecord &range : layer.ranges) {
+      uint64_t start = range.start_index;
+      uint64_t end = range.end_index;
+      if (!project_offset_range(projection, &start, &end)) {
+        projected.projectable = false;
+        projected.ranges.clear();
+        break;
+      }
+      projected.ranges.push_back(InjectionRangeRecord{
+          start, end, analysis_point_for_offset(analysis, start),
+          analysis_point_for_offset(analysis, end), range.scopes});
+    }
+    state->layers.push_back(std::move(projected));
+  }
+  return state;
+}
+
+bool same_projected_ranges(
+    const std::vector<InjectionRangeRecord> &projected,
+    const std::vector<InjectionRangeRecord> &current) {
+  if (projected.size() != current.size())
+    return false;
+  for (size_t index = 0; index < projected.size(); index++) {
+    const InjectionRangeRecord &left = projected[index];
+    const InjectionRangeRecord &right = current[index];
+    if (left.start_index != right.start_index ||
+        left.end_index != right.end_index || left.start != right.start ||
+        left.end != right.end || left.scopes != right.scopes)
+      return false;
+  }
+  return true;
+}
+
+bool same_layer_configuration(const InjectionLayerRecord &previous,
+                              const InjectionLayerRecord &current,
+                              uint64_t current_parent_reuse_slot_id) {
+  return previous.parent_reuse_slot_id == current_parent_reuse_slot_id &&
+         previous.depth == current.depth &&
+         previous.injection_point_id == current.injection_point_id &&
+         previous.query_pattern_index == current.query_pattern_index &&
+         previous.parent_grammar_id == current.parent_grammar_id &&
+         previous.language_name == current.language_name &&
+         previous.language_id == current.language_id &&
+         previous.runtime == current.runtime &&
+         previous.wasm_path == current.wasm_path &&
+         previous.language_name_export == current.language_name_export &&
+         previous.language_segment == current.language_segment &&
+         previous.query_paths == current.query_paths &&
+         previous.include_children == current.include_children &&
+         previous.include_adjacent_whitespace ==
+             current.include_adjacent_whitespace &&
+         previous.newlines_between == current.newlines_between &&
+         previous.cover_shallower_scopes == current.cover_shallower_scopes &&
+         previous.query_defined == current.query_defined &&
+         previous.include_language_scope == current.include_language_scope;
+}
+
+struct LayerReconciliation {
+  bool fallback = false;
+  uint64_t reused_layers = 0;
+  uint64_t projected_ranges = 0;
+  std::vector<SyntaxEdit> syntax_edits;
+};
+
+LayerReconciliation reconcile_layers(
+    InjectionRangeIndex &index,
+    const std::shared_ptr<InjectionReuseState> &reuse) {
+  LayerReconciliation result;
+  if (!reuse || !reuse->previous_index)
+    return result;
+  result.fallback = !reuse->previous_index->layers.empty() ||
+                    !index.layers.empty();
+  if (!reuse->eligible || !reuse->generation_compatible)
+    return result;
+
+  std::vector<size_t> order(index.layers.size());
+  for (size_t index_value = 0; index_value < order.size(); index_value++)
+    order[index_value] = index_value;
+  std::stable_sort(order.begin(), order.end(), [&](size_t left, size_t right) {
+    return index.layers[left].depth < index.layers[right].depth;
+  });
+
+  std::unordered_set<uint64_t> used_previous_slots;
+  std::unordered_map<uint64_t, uint64_t> remapped_slots;
+  uint64_t projected_ranges = 0;
+  for (size_t layer_index : order) {
+    InjectionLayerRecord &layer = index.layers[layer_index];
+    const bool already_current =
+        layer.syntax_parsed && layer.syntax &&
+        layer.syntax->buffer_revision() == reuse->target_tags.syntax_revision;
+    uint64_t parent_reuse_slot_id = layer.parent_reuse_slot_id;
+    const auto remapped_parent = remapped_slots.find(parent_reuse_slot_id);
+    if (remapped_parent != remapped_slots.end())
+      parent_reuse_slot_id = remapped_parent->second;
+    bool used_projection = false;
+    const auto match = std::find_if(
+        reuse->layers.begin(), reuse->layers.end(),
+        [&](const ProjectedInjectionLayer &candidate) {
+          if (candidate.source == nullptr ||
+              used_previous_slots.contains(candidate.source->reuse_slot_id) ||
+              !same_layer_configuration(*candidate.source, layer,
+                                        parent_reuse_slot_id))
+            return false;
+          if (candidate.projectable &&
+              same_projected_ranges(candidate.ranges, layer.ranges)) {
+            used_projection = true;
+            return true;
+          }
+          return reuse->same_extent_edits &&
+                 same_projected_ranges(candidate.source->ranges,
+                                       layer.ranges);
+        });
+    if (match == reuse->layers.end())
+      continue;
+    const uint64_t provisional_slot = layer.reuse_slot_id;
+    layer.reuse_slot_id = match->source->reuse_slot_id;
+    layer.parent_reuse_slot_id = parent_reuse_slot_id;
+    layer.reuse_with_edits = true;
+    remapped_slots.emplace(provisional_slot, layer.reuse_slot_id);
+    used_previous_slots.insert(layer.reuse_slot_id);
+    if (!already_current && used_projection)
+      projected_ranges += layer.ranges.size();
+    if (already_current)
+      layer.reuse_with_edits = false;
+  }
+  result.reused_layers = std::count_if(
+      index.layers.begin(), index.layers.end(), [&](const auto &layer) {
+        return layer.reuse_with_edits &&
+               used_previous_slots.contains(layer.reuse_slot_id);
+      });
+  result.projected_ranges = projected_ranges;
+  if (result.reused_layers > 0)
+    result.syntax_edits = reuse->syntax_edits;
+  result.fallback = used_previous_slots.size() != index.layers.size() ||
+                    used_previous_slots.size() !=
+                        reuse->previous_index->layers.size();
+  return result;
+}
+
+void prune_child_backends(
+    std::unordered_map<uint64_t, std::shared_ptr<SyntaxBackend>> &backends,
+    const InjectionRangeIndex &index) {
+  std::unordered_set<uint64_t> active;
+  active.reserve(index.layers.size());
+  for (const InjectionLayerRecord &layer : index.layers)
+    active.insert(layer.reuse_slot_id);
+  std::erase_if(backends, [&](const auto &entry) {
+    return !active.contains(entry.first);
+  });
+}
+
+void isolate_unparsed_reuse_slots(InjectionRangeIndex &index,
+                                  uint64_t revision,
+                                  uint64_t &next_reuse_slot_id) {
+  std::vector<size_t> order(index.layers.size());
+  for (size_t index_value = 0; index_value < order.size(); index_value++)
+    order[index_value] = index_value;
+  std::stable_sort(order.begin(), order.end(), [&](size_t left, size_t right) {
+    return index.layers[left].depth < index.layers[right].depth;
+  });
+  std::unordered_map<uint64_t, uint64_t> remapped_slots;
+  for (size_t layer_index : order) {
+    InjectionLayerRecord &layer = index.layers[layer_index];
+    const auto parent = remapped_slots.find(layer.parent_reuse_slot_id);
+    if (parent != remapped_slots.end())
+      layer.parent_reuse_slot_id = parent->second;
+    if (layer.syntax_parsed && layer.syntax &&
+        layer.syntax->buffer_revision() == revision)
+      continue;
+    const uint64_t old_slot = layer.reuse_slot_id;
+    layer.reuse_slot_id = next_reuse_slot_id++;
+    layer.reuse_with_edits = false;
+    remapped_slots[old_slot] = layer.reuse_slot_id;
+  }
+}
+
+std::set<InjectionSourceToken> available_source_tokens(
+    const std::shared_ptr<const PublishedSyntaxSnapshot> &root_syntax,
+    const std::string &root_grammar_id, const InjectionRangeIndex &index,
+    const std::map<std::string, uint64_t> &registration_fingerprints) {
+  std::set<InjectionSourceToken> tokens;
+  const auto root_registration =
+      registration_fingerprints.find(root_grammar_id);
+  if (root_syntax && root_registration != registration_fingerprints.end()) {
+    tokens.insert(InjectionSourceToken{0, root_syntax->identity(),
+                                       root_registration->second});
+  }
+  for (const InjectionLayerRecord &layer : index.layers) {
+    const auto registration =
+        registration_fingerprints.find(layer.language_id);
+    if (!layer.syntax_parsed || !layer.syntax ||
+        registration == registration_fingerprints.end())
+      continue;
+    tokens.insert(InjectionSourceToken{layer.reuse_slot_id,
+                                       layer.syntax->identity(),
+                                       registration->second});
+  }
+  return tokens;
+}
+
+bool has_unseen_source_tokens(
+    const std::set<InjectionSourceToken> &available,
+    const std::set<InjectionSourceToken> &seen) {
+  return std::any_of(available.begin(), available.end(),
+                     [&](const InjectionSourceToken &token) {
+                       return !seen.contains(token);
+                     });
 }
 
 bool publish_topology(uint64_t &published_layer_count,
@@ -764,6 +1188,16 @@ void apply_query_grammar(InjectionLayerRecord &layer,
   }
 }
 
+bool same_query_grammar(const InjectionLayerRecord &layer,
+                        const ParsedGrammarDescriptor &grammar) {
+  return layer.language_id == grammar.language_id &&
+         layer.runtime == grammar.runtime &&
+         layer.wasm_path == grammar.wasm_path &&
+         layer.language_name_export == grammar.language_name &&
+         layer.language_segment == grammar.language_segment &&
+         layer.query_paths == grammar.query_paths;
+}
+
 bool query_layer_is_resolved(const InjectionLayerRecord &layer) {
   return !layer.language_id.empty() && layer.runtime == "wasm" &&
          !layer.wasm_path.empty();
@@ -805,6 +1239,7 @@ public:
   struct WorkItem {
     size_t layer_index = 0;
     std::shared_ptr<SyntaxBackend> backend;
+    bool use_edits = false;
   };
 
   InjectionLayerParseWorker(
@@ -814,12 +1249,17 @@ public:
       std::shared_ptr<InjectionRangeIndex> index,
       std::shared_ptr<const SnapshotAnalysis> analysis,
       std::shared_ptr<NativeJobControl> job,
-      std::vector<WorkItem> work_items, uint64_t maximum_utf16_length)
+      std::vector<WorkItem> work_items, std::vector<SyntaxEdit> syntax_edits,
+      uint64_t reused_layers, uint64_t projected_ranges,
+      bool reuse_fallback, uint64_t maximum_utf16_length)
       : Napi::AsyncWorker(env, "DocumentSession.parseInjectionLayers"),
         deferred_(Napi::Promise::Deferred::New(env)),
         session_(std::move(session)), engine_(engine), request_id_(request_id),
         tags_(tags), index_(std::move(index)), analysis_(std::move(analysis)),
         job_(std::move(job)), work_items_(std::move(work_items)),
+        syntax_edits_(std::move(syntax_edits)),
+        reused_layers_(reused_layers), projected_ranges_(projected_ranges),
+        reuse_fallback_(reuse_fallback),
         maximum_utf16_length_(maximum_utf16_length),
         queued_at_(InjectionClock::now()) {}
 
@@ -873,7 +1313,9 @@ public:
       configuration.generation = tags_.language_generation;
 
       SyntaxParseResult result;
-      if (!item.backend->parse(reader, analysis_, configuration, {},
+      const std::vector<SyntaxEdit> &edits =
+          item.use_edits ? syntax_edits_ : no_edits_;
+      if (!item.backend->parse(reader, analysis_, configuration, edits,
                                tags_.buffer_revision,
                                maximum_utf16_length_, cancellation, result)) {
         layer.syntax_error_code = result.error_code.empty()
@@ -891,6 +1333,12 @@ public:
       layer.syntax_root_has_error = result.root_has_error;
       layer.syntax = std::move(result.published_snapshot);
       layer.queries = std::move(result.query_snapshot);
+      if (result.parsed) {
+        if (result.incremental)
+          child_incremental_parses_++;
+        else
+          child_full_parses_++;
+      }
     }
     finalize_index_counts(*index_);
     finish_timing();
@@ -928,7 +1376,30 @@ public:
         engine_->impl_->published_layer_count, *index_);
     if (topology_changed)
       engine_->impl_->topology_generation++;
+    engine_->impl_->reused_layer_count += reused_layers_;
+    engine_->impl_->projected_range_count += projected_ranges_;
+    engine_->impl_->child_incremental_parse_count +=
+        child_incremental_parses_;
+    engine_->impl_->child_full_parse_count += child_full_parses_;
+    const std::set<InjectionSourceToken> available_tokens =
+        available_source_tokens(engine_->impl_->root_syntax,
+                                engine_->impl_->root_grammar_id, *index_,
+                                request->second.registration_fingerprints);
+    const bool unseen_sources = has_unseen_source_tokens(
+        available_tokens, engine_->impl_->seen_source_tokens);
+    const bool rescan_truncated =
+        unseen_sources &&
+        request->second.rescan_wave >= MAX_INJECTION_RESCAN_WAVES;
+    const bool rescan_required = unseen_sources && !rescan_truncated;
+    const bool reuse_fallback = reuse_fallback_ && !rescan_required;
+    if (reuse_fallback)
+      engine_->impl_->reuse_fallback_count++;
     engine_->impl_->published_index = index_;
+    if (!rescan_required)
+      prune_child_backends(engine_->impl_->child_backends, *index_);
+    if (!rescan_required &&
+        engine_->impl_->reuse_state == request->second.reuse)
+      engine_->impl_->reuse_state.reset();
     engine_->impl_->published_generation++;
     engine_->impl_->candidate_count = 0;
     engine_->impl_->requests.erase(request);
@@ -946,6 +1417,21 @@ public:
                  Napi::Number::New(env, queue_milliseconds_));
     response.Set("childParseMilliseconds",
                  Napi::Number::New(env, parse_milliseconds_));
+    response.Set("reusedLayers", Napi::Number::New(env, reused_layers_));
+    response.Set("projectedRanges",
+                 Napi::Number::New(env, projected_ranges_));
+    response.Set("childIncrementalParses",
+                 Napi::Number::New(env, child_incremental_parses_));
+    response.Set("childFullParses",
+                 Napi::Number::New(env, child_full_parses_));
+    response.Set("reuseFallback", Napi::Boolean::New(env, reuse_fallback));
+    response.Set("rescanRequired",
+                 Napi::Boolean::New(env, rescan_required));
+    response.Set("rescanTruncated",
+                 Napi::Boolean::New(env, rescan_truncated));
+    response.Set("sourceTokenFingerprint",
+                 Napi::String::New(
+                     env, source_token_fingerprint(available_tokens)));
     deferred_.Resolve(response);
     lock.unlock();
     finish_injection_job(env, session_);
@@ -978,6 +1464,13 @@ private:
   std::shared_ptr<const SnapshotAnalysis> analysis_;
   std::shared_ptr<NativeJobControl> job_;
   std::vector<WorkItem> work_items_;
+  std::vector<SyntaxEdit> syntax_edits_;
+  const std::vector<SyntaxEdit> no_edits_;
+  uint64_t reused_layers_ = 0;
+  uint64_t projected_ranges_ = 0;
+  uint64_t child_incremental_parses_ = 0;
+  uint64_t child_full_parses_ = 0;
+  bool reuse_fallback_ = false;
   uint64_t maximum_utf16_length_ = MAX_SYNTAX_UTF16_LENGTH;
   bool cancelled_ = false;
   InjectionClock::time_point queued_at_;
@@ -993,14 +1486,31 @@ void InjectionEngine::publish_root(
     std::shared_ptr<const PublishedSyntaxSnapshot> syntax,
     std::shared_ptr<const SyntaxQuerySnapshot> queries,
     const SnapshotAnalysis &analysis, const std::string &grammar_id,
+    const std::vector<RevisionEditBatch> &projection, bool root_incremental,
+    bool injection_workers_idle,
     const void *snapshot_lease) {
+  const std::shared_ptr<const InjectionRangeIndex> previous_index =
+      impl_->published_index;
+  const std::string previous_root_grammar_id = impl_->root_grammar_id;
   impl_->stale_request_count += impl_->requests.size();
   impl_->requests.clear();
+  impl_->candidate_epoch++;
+  impl_->seen_source_tokens.clear();
   impl_->candidate_count = 0;
   impl_->root_syntax = std::move(syntax);
   impl_->root_queries = std::move(queries);
   impl_->analysis = analysis;
   impl_->root_grammar_id = grammar_id;
+  InjectionRevisionTags target_tags;
+  if (impl_->root_syntax) {
+    target_tags = InjectionRevisionTags{
+        impl_->root_syntax->buffer_revision(),
+        impl_->root_syntax->buffer_revision(),
+        impl_->root_syntax->language_generation()};
+  }
+  impl_->reuse_state = build_reuse_state(
+      previous_index, projection, root_incremental, target_tags, analysis,
+      previous_root_grammar_id == grammar_id, injection_workers_idle);
   impl_->query_proposals.clear();
   if (impl_->root_syntax && snapshot_lease != nullptr) {
     SnapshotReader reader(
@@ -1020,6 +1530,8 @@ void InjectionEngine::publish_root(
   for (const QueryInjectionProposal &proposal : impl_->query_proposals) {
     InjectionLayerRecord layer;
     layer.layer_id = impl_->next_layer_id++;
+    layer.reuse_slot_id = impl_->next_reuse_slot_id++;
+    layer.query_pattern_index = proposal.pattern_index;
     layer.depth = 1;
     layer.parent_grammar_id = proposal.parent_grammar_id;
     layer.language_name = proposal.target_self || proposal.target_parent
@@ -1049,11 +1561,14 @@ void InjectionEngine::publish_root(
 void InjectionEngine::clear() {
   impl_->stale_request_count += impl_->requests.size();
   impl_->requests.clear();
+  impl_->candidate_epoch++;
+  impl_->seen_source_tokens.clear();
   impl_->root_syntax.reset();
   impl_->root_queries.reset();
   impl_->root_grammar_id.clear();
   impl_->query_proposals.clear();
   impl_->published_index.reset();
+  impl_->reuse_state.reset();
   impl_->child_backends.clear();
   impl_->query_grammars.clear();
   impl_->query_rejected_aliases.clear();
@@ -1075,6 +1590,13 @@ InjectionEngineDiagnostics InjectionEngine::diagnostics() const {
   result.aborted_request_count = impl_->aborted_request_count;
   result.published_generation = impl_->published_generation;
   result.topology_generation = impl_->topology_generation;
+  result.reused_layer_count = impl_->reused_layer_count;
+  result.projected_range_count = impl_->projected_range_count;
+  result.child_incremental_parse_count =
+      impl_->child_incremental_parse_count;
+  result.child_full_parse_count = impl_->child_full_parse_count;
+  result.reuse_fallback_count = impl_->reuse_fallback_count;
+  result.child_backend_count = impl_->child_backends.size();
   result.query_language_resolution_count =
       impl_->query_language_resolution_count;
   result.query_language_rejection_count =
@@ -1165,18 +1687,36 @@ Napi::Value InjectionEngine::queue_child_parse(
     return throw_error(env, "Injected language parse is already active",
                        "ERR_INJECTION_PARSE_ACTIVE");
 
+  const bool overlapping_injection_job = session->active_injection_jobs > 0;
+  if (request.reuse && overlapping_injection_job)
+    request.reuse->eligible = false;
+  LayerReconciliation reconciliation =
+      reconcile_layers(*request.staged_index, request.reuse);
+  if (overlapping_injection_job) {
+    isolate_unparsed_reuse_slots(*request.staged_index,
+                                 request.tags.syntax_revision,
+                                 impl_->next_reuse_slot_id);
+    reconciliation.reused_layers = 0;
+    reconciliation.projected_ranges = 0;
+    reconciliation.syntax_edits.clear();
+    reconciliation.fallback = !request.staged_index->layers.empty();
+  }
+
   std::vector<InjectionLayerParseWorker::WorkItem> work_items;
   for (size_t index = 0; index < request.staged_index->layers.size(); index++) {
     InjectionLayerRecord &layer = request.staged_index->layers[index];
     if (layer.runtime != "wasm" || layer.wasm_path.empty() ||
-        layer.ranges.empty())
+        layer.ranges.empty() ||
+        (layer.syntax_parsed && layer.syntax &&
+         layer.syntax->buffer_revision() == request.tags.syntax_revision))
       continue;
     std::shared_ptr<SyntaxBackend> &backend =
-        impl_->child_backends[layer.layer_id];
+        impl_->child_backends[layer.reuse_slot_id];
     if (!backend)
       backend = std::make_shared<SyntaxBackend>();
     work_items.push_back(
-        InjectionLayerParseWorker::WorkItem{index, backend});
+        InjectionLayerParseWorker::WorkItem{
+            index, backend, layer.reuse_with_edits});
   }
   if (work_items.empty()) {
     finalize_index_counts(*request.staged_index);
@@ -1184,21 +1724,63 @@ Napi::Value InjectionEngine::queue_child_parse(
         publish_topology(impl_->published_layer_count, *request.staged_index);
     if (topology_changed)
       impl_->topology_generation++;
+    impl_->reused_layer_count += reconciliation.reused_layers;
+    impl_->projected_range_count += reconciliation.projected_ranges;
+    const std::set<InjectionSourceToken> available_tokens =
+        available_source_tokens(impl_->root_syntax, impl_->root_grammar_id,
+                                *request.staged_index,
+                                request.registration_fingerprints);
+    const bool unseen_sources =
+        has_unseen_source_tokens(available_tokens, impl_->seen_source_tokens);
+    const bool rescan_truncated =
+        unseen_sources && request.rescan_wave >= MAX_INJECTION_RESCAN_WAVES;
+    const bool rescan_required = unseen_sources && !rescan_truncated;
+    const bool reuse_fallback =
+        reconciliation.fallback && !rescan_required;
+    if (reuse_fallback)
+      impl_->reuse_fallback_count++;
     impl_->published_index = request.staged_index;
+    if (!rescan_required)
+      prune_child_backends(impl_->child_backends, *request.staged_index);
+    if (!rescan_required && impl_->reuse_state == request.reuse)
+      impl_->reuse_state.reset();
     impl_->published_generation++;
     impl_->candidate_count = 0;
     const InjectionRevisionTags tags = request.tags;
+    const uint64_t parsed_child_layers =
+        request.staged_index->parsed_child_layer_count;
+    const uint64_t failed_child_layers =
+        request.staged_index->failed_child_layer_count;
     impl_->requests.erase(request_found);
     Napi::Object response = Napi::Object::New(env);
     response.Set("accepted", Napi::Boolean::New(env, true));
     set_tags(response, tags);
     response.Set("requestId", Napi::Number::New(env, request_id));
-    response.Set("parsedChildLayers", Napi::Number::New(env, 0));
-    response.Set("failedChildLayers", Napi::Number::New(env, 0));
+    response.Set(
+        "parsedChildLayers",
+        Napi::Number::New(env, parsed_child_layers));
+    response.Set(
+        "failedChildLayers",
+        Napi::Number::New(env, failed_child_layers));
     response.Set("topologyChanged",
                  Napi::Boolean::New(env, topology_changed));
     response.Set("childParseQueueMilliseconds", Napi::Number::New(env, 0));
     response.Set("childParseMilliseconds", Napi::Number::New(env, 0));
+    response.Set("reusedLayers",
+                 Napi::Number::New(env, reconciliation.reused_layers));
+    response.Set("projectedRanges",
+                 Napi::Number::New(env, reconciliation.projected_ranges));
+    response.Set("childIncrementalParses", Napi::Number::New(env, 0));
+    response.Set("childFullParses", Napi::Number::New(env, 0));
+    response.Set("reuseFallback",
+                 Napi::Boolean::New(env, reuse_fallback));
+    response.Set("rescanRequired",
+                 Napi::Boolean::New(env, rescan_required));
+    response.Set("rescanTruncated",
+                 Napi::Boolean::New(env, rescan_truncated));
+    response.Set("sourceTokenFingerprint",
+                 Napi::String::New(
+                     env, source_token_fingerprint(available_tokens)));
     return response;
   }
 
@@ -1218,6 +1800,9 @@ Napi::Value InjectionEngine::queue_child_parse(
   auto *worker = new InjectionLayerParseWorker(
       env, session, this, request_id, request.tags, request.staged_index,
       session->syntax_analysis, std::move(job), std::move(work_items),
+      std::move(reconciliation.syntax_edits),
+      reconciliation.reused_layers, reconciliation.projected_ranges,
+      reconciliation.fallback,
       session->maximum_syntax_utf16_length);
   Napi::Promise promise = worker->promise();
   worker->Queue();
@@ -1234,9 +1819,15 @@ Napi::Value InjectionEngine::get_candidates(
   Napi::Object request = info[0].As<Napi::Object>();
   InjectionRevisionTags tags;
   uint64_t generation = 0;
+  uint32_t rescan_wave = 0;
   if (!read_tags(request, &tags) ||
       !read_uint64(request.Get("injectionPointGeneration"), &generation))
     return throw_type_error(env, "Injection request revision tags are invalid",
+                            "ERR_INVALID_INJECTION_REQUEST");
+  Napi::Value rescan_wave_value = request.Get("injectionRescanWave");
+  if (!rescan_wave_value.IsUndefined() &&
+      !read_uint32(rescan_wave_value, &rescan_wave))
+    return throw_type_error(env, "Injection rescan wave must fit uint32",
                             "ERR_INVALID_INJECTION_REQUEST");
   std::vector<GrammarManifestEntry> manifest;
   if (!parse_manifest(env, request.Get("grammars"), &manifest))
@@ -1244,26 +1835,33 @@ Napi::Value InjectionEngine::get_candidates(
 
   std::vector<CandidateSource> sources;
   auto job = std::make_shared<NativeJobControl>();
+  uint64_t candidate_epoch = 0;
   {
     std::lock_guard<std::mutex> lock(session->mutex);
     if (!current_tags_locked(*session, tags) || !session->published_syntax ||
         session->published_syntax->buffer_revision() != tags.syntax_revision)
       return stale_result(env, tags, "stale-request");
+    impl_->stale_request_count += impl_->requests.size();
+    impl_->requests.clear();
+    candidate_epoch = ++impl_->candidate_epoch;
     sources.push_back(CandidateSource{session->published_syntax,
-                                     impl_->root_grammar_id, 0, 0});
+                                     impl_->root_grammar_id, 0, 0, 0});
     if (impl_->published_index) {
       for (const InjectionLayerRecord &layer : impl_->published_index->layers) {
         if (layer.syntax_parsed && layer.syntax)
-          sources.push_back(CandidateSource{layer.syntax, layer.language_id,
-                                            layer.layer_id, layer.depth});
+          sources.push_back(CandidateSource{
+              layer.syntax, layer.language_id, layer.layer_id,
+              layer.reuse_slot_id, layer.depth});
       }
     }
     session->active_injection_jobs++;
     register_native_job_locked(*session, job);
   }
   auto *worker = new InjectionCandidateWorker(
-      env, session, this, std::move(sources), std::move(manifest), tags,
-      generation, std::move(job));
+      env, session, this, std::move(sources), std::move(manifest),
+      rescan_wave > 0 ? impl_->seen_source_tokens
+                      : std::set<InjectionSourceToken>{},
+      tags, generation, rescan_wave, candidate_epoch, std::move(job));
   Napi::Promise promise = worker->promise();
   worker->Queue();
   return promise;
@@ -1281,37 +1879,39 @@ Napi::Value InjectionEngine::resolve_node(
   Napi::Object tag_object = info[1].As<Napi::Object>();
   InjectionRevisionTags tags;
   uint32_t candidate_id = 0;
+  uint64_t request_id = 0;
   if (!read_tags(tag_object, &tags) ||
-      !read_uint32(candidate.Get("candidateId"), &candidate_id))
+      !read_uint32(candidate.Get("candidateId"), &candidate_id) ||
+      !read_uint64(candidate.Get("requestId"), &request_id))
     return throw_type_error(env, "Injection candidate identity is invalid",
                             "ERR_INVALID_INJECTION_REQUEST");
 
   std::lock_guard<std::mutex> lock(session->mutex);
   if (!current_tags_locked(*session, tags))
     return stale_node(env);
-  for (auto &[request_id, request] : impl_->requests) {
-    (void)request_id;
-    if (!tags_equal(request.tags, tags))
-      continue;
-    auto found = request.candidates.find(candidate_id);
-    if (found == request.candidates.end())
-      continue;
-    const InjectionCandidateRecord &record = found->second;
-    Napi::Value requested_handle = candidate.Get("nodeHandle");
-    uint32_t handle = record.node_handle;
-    if (!requested_handle.IsUndefined()) {
-      uint32_t parsed_handle = 0;
-      if (!read_uint32(requested_handle, &parsed_handle) ||
-          parsed_handle != handle)
-        return throw_error(env, "Injection node handle does not match candidate",
-                           "ERR_INVALID_INJECTION_NODE_HANDLE");
-    }
-    return InjectionNodeWrapper::new_instance(env, session, record.syntax,
-                                               handle, tags,
-                                               session->syntax_lease);
+  const auto request = impl_->requests.find(request_id);
+  if (request == impl_->requests.end() ||
+      request->second.candidate_epoch != impl_->candidate_epoch ||
+      !tags_equal(request->second.tags, tags))
+    return throw_error(env, "Injection candidate is no longer active",
+                       "ERR_STALE_INJECTION_NODE");
+  const auto found = request->second.candidates.find(candidate_id);
+  if (found == request->second.candidates.end())
+    return throw_error(env, "Injection candidate is no longer active",
+                       "ERR_STALE_INJECTION_NODE");
+  const InjectionCandidateRecord &record = found->second;
+  Napi::Value requested_handle = candidate.Get("nodeHandle");
+  uint32_t handle = record.node_handle;
+  if (!requested_handle.IsUndefined()) {
+    uint32_t parsed_handle = 0;
+    if (!read_uint32(requested_handle, &parsed_handle) ||
+        parsed_handle != handle)
+      return throw_error(env, "Injection node handle does not match candidate",
+                         "ERR_INVALID_INJECTION_NODE_HANDLE");
   }
-  return throw_error(env, "Injection candidate is no longer active",
-                     "ERR_STALE_INJECTION_NODE");
+  return InjectionNodeWrapper::new_instance(env, session, record.syntax,
+                                             handle, tags,
+                                             session->syntax_lease);
 }
 
 Napi::Value InjectionEngine::resolve_query_node(
@@ -1718,6 +2318,18 @@ Napi::Value InjectionEngine::apply_result_object(
       return throw_error(env, "Injection candidate no longer has a syntax node",
                          "ERR_STALE_INJECTION_NODE");
     const InjectionCandidateRecord &candidate_record = candidate_found->second;
+    if (candidate_record.parent_layer_id != 0) {
+      const auto current_parent = std::find_if(
+          request.staged_index->layers.begin(),
+          request.staged_index->layers.end(),
+          [&](const InjectionLayerRecord &candidate) {
+            return candidate.layer_id == candidate_record.parent_layer_id &&
+                   candidate.reuse_slot_id ==
+                       candidate_record.parent_reuse_slot_id;
+          });
+      if (current_parent == request.staged_index->layers.end())
+        continue;
+    }
     ParsedGrammarDescriptor grammar;
     if (!parse_grammar_descriptor(env, result.Get("grammar"), &grammar))
       return env.Undefined();
@@ -1745,6 +2357,7 @@ Napi::Value InjectionEngine::apply_result_object(
 
     InjectionLayerRecord layer;
     layer.parent_layer_id = candidate_record.parent_layer_id;
+    layer.parent_reuse_slot_id = candidate_record.parent_reuse_slot_id;
     layer.depth = candidate_record.depth + 1;
     layer.candidate_id = candidate_id;
     layer.injection_point_id = injection_point_id;
@@ -1768,35 +2381,8 @@ Napi::Value InjectionEngine::apply_result_object(
     layer.query_defined = result.Get("queryDefined").ToBoolean().Value();
     layer.ranges = std::move(ranges);
 
-    auto same_ranges = [](const std::vector<InjectionRangeRecord> &left,
-                          const std::vector<InjectionRangeRecord> &right) {
-      if (left.size() != right.size())
-        return false;
-      for (size_t index = 0; index < left.size(); index++) {
-        if (left[index].start_index != right[index].start_index ||
-            left[index].end_index != right[index].end_index)
-          return false;
-      }
-      return true;
-    };
-    const InjectionLayerRecord *previous_layer = nullptr;
-    if (impl_->published_index) {
-      auto previous = std::find_if(
-          impl_->published_index->layers.begin(),
-          impl_->published_index->layers.end(),
-          [&](const InjectionLayerRecord &candidate) {
-            return !candidate.query_defined &&
-                   candidate.parent_layer_id == layer.parent_layer_id &&
-                   candidate.injection_point_id == layer.injection_point_id &&
-                   candidate.parent_grammar_id == layer.parent_grammar_id &&
-                   candidate.language_id == layer.language_id &&
-                   same_ranges(candidate.ranges, layer.ranges);
-          });
-      if (previous != impl_->published_index->layers.end())
-        previous_layer = &*previous;
-    }
-    layer.layer_id = previous_layer != nullptr ? previous_layer->layer_id
-                                               : impl_->next_layer_id++;
+    layer.layer_id = impl_->next_layer_id++;
+    layer.reuse_slot_id = impl_->next_reuse_slot_id++;
 
     const bool dynamic_scope =
         result.Get("languageScopeIsDynamic").ToBoolean().Value();
@@ -2015,8 +2601,20 @@ Napi::Value InjectionEngine::apply_query_language_descriptors(
     if (!layer.query_defined)
       continue;
     const auto grammar = impl_->query_grammars.find(layer.language_name);
-    if (grammar != impl_->query_grammars.end())
+    if (grammar != impl_->query_grammars.end()) {
+      if (layer.syntax_parsed && !same_query_grammar(layer, grammar->second)) {
+        layer.layer_id = impl_->next_layer_id++;
+        layer.reuse_slot_id = impl_->next_reuse_slot_id++;
+        layer.reuse_with_edits = false;
+        layer.syntax_parsed = false;
+        layer.syntax_root_has_error = false;
+        layer.syntax_error_code.clear();
+        layer.syntax_error_message.clear();
+        layer.syntax.reset();
+        layer.queries.reset();
+      }
       apply_query_grammar(layer, grammar->second);
+    }
   }
   layers.erase(
       std::remove_if(layers.begin(), layers.end(),
@@ -2871,6 +3469,7 @@ std::vector<QueryInjectionProposal> query_injection_proposals(
         "none";
 
     QueryInjectionProposal proposal;
+    proposal.pattern_index = match.pattern_index;
     proposal.parent_grammar_id = grammar_id;
     proposal.language_name = language;
     proposal.target_self = target_self;
@@ -2951,6 +3550,56 @@ bool parse_manifest(Napi::Env env, Napi::Value value,
       }
       entry.types.push_back(type.As<Napi::String>().Utf8Value());
     }
+    std::vector<std::pair<uint32_t, std::string>> registrations;
+    Napi::Value registrations_value = grammar.Get("registrations");
+    if (registrations_value.IsArray()) {
+      Napi::Array values = registrations_value.As<Napi::Array>();
+      registrations.reserve(values.Length());
+      for (uint32_t registration_index = 0;
+           registration_index < values.Length(); registration_index++) {
+        Napi::Value registration_value = values.Get(registration_index);
+        if (!registration_value.IsObject()) {
+          throw_type_error(env,
+                           "Injection manifest registrations must be objects",
+                           "ERR_INVALID_INJECTION_MANIFEST");
+          return false;
+        }
+        Napi::Object registration = registration_value.As<Napi::Object>();
+        uint32_t id = 0;
+        if (!read_uint32(registration.Get("id"), &id) ||
+            !registration.Get("type").IsString()) {
+          throw_type_error(env,
+                           "Injection manifest registration fields are invalid",
+                           "ERR_INVALID_INJECTION_MANIFEST");
+          return false;
+        }
+        registrations.emplace_back(
+            id, registration.Get("type").As<Napi::String>().Utf8Value());
+      }
+    }
+    std::sort(registrations.begin(), registrations.end());
+    constexpr uint64_t offset_basis = UINT64_C(14695981039346656037);
+    constexpr uint64_t prime = UINT64_C(1099511628211);
+    uint64_t fingerprint = offset_basis;
+    const auto hash_bytes = [&](std::string_view bytes) {
+      for (unsigned char byte : bytes) {
+        fingerprint ^= byte;
+        fingerprint *= prime;
+      }
+    };
+    hash_bytes(entry.grammar_id);
+    if (registrations.empty()) {
+      std::sort(entry.types.begin(), entry.types.end());
+      for (const std::string &type : entry.types)
+        hash_bytes(type);
+    } else {
+      for (const auto &[id, type] : registrations) {
+        hash_bytes(std::string_view(
+            reinterpret_cast<const char *>(&id), sizeof(id)));
+        hash_bytes(type);
+      }
+    }
+    entry.registration_fingerprint = fingerprint;
     manifest->push_back(std::move(entry));
   }
   return true;

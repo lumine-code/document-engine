@@ -57,6 +57,8 @@ Display highlighting uses a separate internal request/commit handshake: a worker
 
 Layered query results merge the root tree with every parsed injection snapshot in deterministic depth/layer order, clip captures to included ranges, preserve per-layer grammar identity and stable node handles, apply `coverShallowerScopes`, and optionally synthesize base language scopes. While a newer buffer revision is awaiting syntax, queries read the lease paired with the published tree, project unchanged ranges through accepted edits and omit every capture intersecting changed text. Query-defined injection aliases are resolved through a revision-tagged registry round trip; only portable grammar descriptors cross into native code, while ranges remain native and are parsed as child layers after resolution.
 
+Consecutive incremental revisions reconcile freshly discovered injection layers against projected prior ranges. Public layer ids remain publication-scoped, while a private reuse slot preserves an exclusively owned child parser for matching layers; incompatible or range-shape-changing layers fall back independently to a full parse. Nested callback sources are scanned in bounded tokenized waves, and diagnostics report reused layers, projected ranges, incremental and full child parses, reuse fallbacks and retained child backends.
+
 ## Snapshot and lifecycle boundary
 
 Snapshots passed to `applyRevision` must come from a compatible native Superstring build. Browser Superstring snapshots are deliberately unsupported. Every environment registers an asynchronous N-API cleanup hook; sessions, workers, syntax-node handles and their retained snapshot leases are cancelled and drained before teardown completes.

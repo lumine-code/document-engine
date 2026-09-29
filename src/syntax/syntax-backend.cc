@@ -1,6 +1,7 @@
 #include "syntax/syntax-backend.h"
 
 #include "syntax/query-engine.h"
+#include "revision-projection.h"
 #include "text-bridge/snapshot-reader.h"
 
 #include <tree_sitter/api.h>
@@ -484,6 +485,45 @@ bool same_included_ranges(
   return true;
 }
 
+bool included_ranges_match_after_edit(
+    const std::vector<SyntaxConfiguration::IncludedRange> &previous,
+    const std::vector<SyntaxConfiguration::IncludedRange> &current,
+    const SyntaxEdit &edit, const SnapshotAnalysis &old_analysis,
+    const SnapshotAnalysis &new_analysis) {
+  if (previous.size() != current.size() || edit.old_start != edit.new_start)
+    return false;
+  const uint64_t old_start =
+      analysis_offset_for_point(old_analysis, edit.old_start);
+  const uint64_t old_end = analysis_offset_for_point(old_analysis, edit.old_end);
+  const uint64_t new_end = analysis_offset_for_point(new_analysis, edit.new_end);
+  const auto intersects = [&](uint64_t start, uint64_t end) {
+    if (old_start == old_end)
+      return start < old_start && old_start < end;
+    return start < old_end && old_start < end;
+  };
+  const auto project = [&](uint64_t offset, bool forward) {
+    if (old_end < offset || (old_end == offset && forward))
+      return new_end + (offset - old_end);
+    return offset;
+  };
+  for (size_t index = 0; index < previous.size(); index++) {
+    const SyntaxConfiguration::IncludedRange &before = previous[index];
+    const SyntaxConfiguration::IncludedRange &after = current[index];
+    if (intersects(before.start_index, before.end_index))
+      return false;
+    const uint64_t projected_start = project(before.start_index, true);
+    const uint64_t projected_end = project(before.end_index, false);
+    if (projected_end < projected_start ||
+        projected_start != after.start_index ||
+        projected_end != after.end_index ||
+        analysis_point_for_offset(new_analysis, projected_start) !=
+            after.start ||
+        analysis_point_for_offset(new_analysis, projected_end) != after.end)
+      return false;
+  }
+  return true;
+}
+
 bool build_included_ranges(
     const std::vector<SyntaxConfiguration::IncludedRange> &source,
     std::vector<TSRange> &output) {
@@ -622,9 +662,16 @@ bool SyntaxBackend::parse(
   const bool included_ranges_unchanged =
       same_included_ranges(runtime.included_ranges,
                            configuration.included_ranges);
+  const bool included_ranges_projected =
+      !included_ranges_unchanged && edits.size() == 1 &&
+      runtime.tree_analysis != nullptr &&
+      included_ranges_match_after_edit(
+          runtime.included_ranges, configuration.included_ranges,
+          edits.front(), *runtime.tree_analysis, *analysis);
 
   TSTree *old_tree = nullptr;
-  if (included_ranges_unchanged && runtime.tree != nullptr &&
+  if ((included_ranges_unchanged || included_ranges_projected) &&
+      runtime.tree != nullptr &&
       runtime.tree_revision + 1 == revision &&
       runtime.tree_analysis != nullptr) {
     if (edits.empty() && analysis->checksum_complete &&

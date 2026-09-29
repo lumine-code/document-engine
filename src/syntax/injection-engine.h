@@ -43,9 +43,14 @@ struct InjectionRangeRecord {
 struct InjectionLayerRecord {
   uint64_t layer_id = 0;
   uint64_t parent_layer_id = 0;
+  // Private stable identity for child parser reuse. Public layer_id remains
+  // publication-scoped so stale node handles cannot alias a newer tree.
+  uint64_t reuse_slot_id = 0;
+  uint64_t parent_reuse_slot_id = 0;
   uint32_t depth = 0;
   uint32_t candidate_id = 0;
   uint32_t injection_point_id = 0;
+  uint32_t query_pattern_index = UINT32_MAX;
   std::string parent_grammar_id;
   std::string language_name;
   std::string language_id;
@@ -60,6 +65,7 @@ struct InjectionLayerRecord {
   bool cover_shallower_scopes = false;
   bool query_defined = false;
   bool include_language_scope = true;
+  bool reuse_with_edits = false;
   bool syntax_parsed = false;
   bool syntax_root_has_error = false;
   std::string syntax_error_code;
@@ -98,6 +104,12 @@ struct InjectionEngineDiagnostics {
   uint64_t aborted_request_count = 0;
   uint64_t published_generation = 0;
   uint64_t topology_generation = 0;
+  uint64_t reused_layer_count = 0;
+  uint64_t projected_range_count = 0;
+  uint64_t child_incremental_parse_count = 0;
+  uint64_t child_full_parse_count = 0;
+  uint64_t reuse_fallback_count = 0;
+  uint64_t child_backend_count = 0;
 };
 
 struct InjectionQuerySource {
@@ -126,6 +138,8 @@ public:
       std::shared_ptr<const PublishedSyntaxSnapshot> syntax,
       std::shared_ptr<const SyntaxQuerySnapshot> queries,
       const SnapshotAnalysis &analysis, const std::string &grammar_id,
+      const std::vector<RevisionEditBatch> &projection,
+      bool root_incremental, bool injection_workers_idle,
       const void *snapshot_lease);
   void clear();
 
