@@ -189,6 +189,7 @@ Napi::Object init_addon(Napi::Env env, Napi::Object exports) {
   capabilities.Set("snapshotLeaseAbi", Napi::Number::New(env, 1));
   capabilities.Set("nativeDisplayIndex", Napi::Boolean::New(env, true));
   capabilities.Set("nativeDisplayParity", Napi::Boolean::New(env, true));
+  capabilities.Set("nativeAsyncHighlights", Napi::Boolean::New(env, true));
   capabilities.Set("nativeDynamicInjections", Napi::Boolean::New(env, true));
   capabilities.Set("nativeInjectionChildParsing",
                    Napi::Boolean::New(env, true));

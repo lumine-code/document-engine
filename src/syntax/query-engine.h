@@ -206,6 +206,7 @@ public:
 
   std::vector<std::string>
   scope_config_keys(const std::string &query_type) const;
+  bool query_may_escape_node_range(const std::string &query_type) const;
 
 private:
   struct Impl;

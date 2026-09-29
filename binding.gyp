@@ -89,11 +89,13 @@
       "sources": [
         "src/bindings/addon.cc",
         "src/bindings/document-session.cc",
+        "src/bindings/highlight-index-bindings.cc",
         "src/bindings/display-view.cc",
         "src/display/display-index.cc",
         "src/display/render-plan.cc",
         "src/revision-projection.cc",
         "src/syntax/injection-engine.cc",
+        "src/syntax/highlight-index.cc",
         "src/syntax/js-regex.cc",
         "src/syntax/layered-query.cc",
         "src/syntax/query-engine.cc",

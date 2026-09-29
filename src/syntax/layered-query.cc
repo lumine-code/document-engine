@@ -173,6 +173,8 @@ bool execute_layered_query(
     uint64_t buffer_revision, uint64_t language_generation,
     const QueryRange &range, const LayeredQueryContext &context,
     QuerySnapshotCache *cache,
+    QueryCancellationFunction cancellation,
+    void *cancellation_payload,
     std::shared_ptr<const QueryIndexSnapshot> &snapshot,
     QueryErrorInfo &error, QueryRunStatistics &statistics) {
   error = QueryErrorInfo{};
@@ -280,7 +282,8 @@ bool execute_layered_query(
                          syntax_analysis,
                          source_revision,
                          source.syntax->language_generation(),
-                         syntax_query_range, resolution, nullptr, nullptr,
+                         syntax_query_range, resolution, cancellation,
+                         cancellation_payload,
                          index, error,
                          statistics))
         return false;

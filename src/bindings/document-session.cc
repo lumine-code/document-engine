@@ -2,8 +2,10 @@
 
 #include "bindings/addon-data.h"
 #include "bindings/display-view.h"
+#include "bindings/highlight-index-bindings.h"
 #include "snapshot-lease.h"
 #include "syntax/injection-engine.h"
+#include "syntax/highlight-index.h"
 #include "syntax/query-engine.h"
 #include "syntax/layered-query.h"
 #include "syntax/query-snapshot-cache.h"
@@ -139,6 +141,12 @@ void clear_display_highlights(SessionState &state) {
       iterator = state.display_views.erase(iterator);
     }
   }
+  if (state.highlight_index) {
+    state.highlight_cancellation_signal.fetch_add(1,
+                                                   std::memory_order_relaxed);
+    state.highlight_index->invalidate();
+    state.staged_highlight_batches.clear();
+  }
 }
 
 void reject_request(Napi::Env env, std::unique_ptr<RevisionRequest> request,
@@ -159,7 +167,10 @@ void resolve_drains_if_idle(Napi::Env env,
   DocumentSessionWrapper *owner_to_release = nullptr;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->active || state->pending || state->active_injection_jobs > 0)
+    if (state->active || state->pending || state->active_injection_jobs > 0 ||
+        state->active_highlight_jobs > 0 ||
+        state->pending_highlight_request ||
+        !state->staged_highlight_batches.empty())
       return;
     waiters.swap(state->drain_waiters);
     if (state->owner_referenced) {
@@ -775,6 +786,21 @@ void finish_injection_job_without_js(
     state->addon_data->notify_cleanup_progress();
 }
 
+void finish_highlight_job(Napi::Env env,
+                          const std::shared_ptr<SessionState> &state) {
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->active_highlight_jobs > 0)
+      state->active_highlight_jobs--;
+  }
+  resolve_drains_if_idle(env, state);
+}
+
+void resolve_session_drains_if_idle(
+    Napi::Env env, const std::shared_ptr<SessionState> &state) {
+  resolve_drains_if_idle(env, state);
+}
+
 NativeJobControl::NativeJobControl(
     const SuperstringSnapshotLease *lease)
     : owner_thread_(std::this_thread::get_id()), lease_(lease) {}
@@ -833,6 +859,12 @@ void begin_environment_cleanup(
     state->analysis.reset();
     state->syntax_analysis.reset();
     state->published_syntax.reset();
+    state->highlight_cancellation_signal.fetch_add(
+        1, std::memory_order_relaxed);
+    state->highlight_index->invalidate();
+    state->active_highlight_request.reset();
+    state->pending_highlight_request.reset();
+    state->staged_highlight_batches.clear();
     state->transient_node_lease_ids.clear();
     state->drain_waiters.clear();
     state->injection_engine->clear();
@@ -862,6 +894,7 @@ bool environment_cleanup_complete(
     state->native_jobs.clear();
     state->active = false;
     state->active_injection_jobs = 0;
+    state->active_highlight_jobs = 0;
   }
   return true;
 }
@@ -869,7 +902,8 @@ bool environment_cleanup_complete(
 SessionState::SessionState(AddonData *data)
     : addon_data(data), syntax_backend(std::make_unique<SyntaxBackend>()),
       injection_engine(std::make_unique<InjectionEngine>()),
-      query_snapshot_cache(std::make_unique<QuerySnapshotCache>()) {}
+      query_snapshot_cache(std::make_unique<QuerySnapshotCache>()),
+      highlight_index(std::make_unique<NativeHighlightIndex>()) {}
 
 SessionState::~SessionState() {
   if (addon_data != nullptr) {
@@ -897,10 +931,20 @@ Napi::Function DocumentSessionWrapper::init(Napi::Env env) {
        InstanceMethod<&DocumentSessionWrapper::set_language>("setLanguage"),
        InstanceMethod<&DocumentSessionWrapper::configure_syntax>(
            "configureSyntax"),
-        InstanceMethod<&DocumentSessionWrapper::get_query_captures>(
-            "getQueryCaptures"),
-        InstanceMethod<&DocumentSessionWrapper::get_query_requirements>(
-            "getQueryRequirements"),
+       InstanceMethod<&DocumentSessionWrapper::get_query_captures>(
+           "getQueryCaptures"),
+       InstanceMethod<&DocumentSessionWrapper::get_query_requirements>(
+           "getQueryRequirements"),
+       InstanceMethod<&DocumentSessionWrapper::request_highlight_coverage>(
+           "requestHighlightCoverage"),
+       InstanceMethod<&DocumentSessionWrapper::commit_highlight_coverage>(
+           "commitHighlightCoverage"),
+       InstanceMethod<&DocumentSessionWrapper::abort_highlight_coverage>(
+           "abortHighlightCoverage"),
+       InstanceMethod<&DocumentSessionWrapper::invalidate_highlight_index>(
+           "invalidateHighlightIndex"),
+       InstanceMethod<&DocumentSessionWrapper::use_synchronous_highlights>(
+           "useSynchronousHighlights"),
        InstanceMethod<&DocumentSessionWrapper::get_injection_candidates>(
            "getInjectionCandidates"),
        InstanceMethod<&DocumentSessionWrapper::resolve_injection_node>(
@@ -995,6 +1039,8 @@ DocumentSessionWrapper::~DocumentSessionWrapper() {
     std::lock_guard<std::mutex> lock(state_->mutex);
     state_->destroyed = true;
     state_->destroyed_signal.store(true, std::memory_order_relaxed);
+    state_->highlight_cancellation_signal.fetch_add(
+        1, std::memory_order_relaxed);
     state_->owner = nullptr;
     pending = std::move(state_->pending);
     current = state_->current_lease;
@@ -1004,6 +1050,9 @@ DocumentSessionWrapper::~DocumentSessionWrapper() {
     state_->analysis.reset();
     state_->syntax_analysis.reset();
     state_->published_syntax.reset();
+    state_->highlight_index->invalidate();
+    state_->pending_highlight_request.reset();
+    state_->staged_highlight_batches.clear();
     transient_node_lease_ids.assign(state_->transient_node_lease_ids.begin(),
                                     state_->transient_node_lease_ids.end());
     state_->transient_node_lease_ids.clear();
@@ -1184,6 +1233,10 @@ Napi::Value DocumentSessionWrapper::apply_revision(
     }
     state_->latest_requested_revision = revision;
     state_->latest_requested_signal.store(revision, std::memory_order_relaxed);
+    state_->highlight_cancellation_signal.fetch_add(
+        1, std::memory_order_relaxed);
+    state_->highlight_index->invalidate();
+    state_->staged_highlight_batches.clear();
     state_->counters.revisions_requested++;
     state_->counters.revisions_published++;
     state_->counters.snapshot_chunks_read += request->chunks_read;
@@ -1278,6 +1331,7 @@ Napi::Value DocumentSessionWrapper::apply_revision(
   } else if (start_now) {
     queue_request(env, state_, std::move(request));
   }
+  resolve_drains_if_idle(env, state_);
   return promise;
 }
 
@@ -1306,8 +1360,9 @@ Napi::Value DocumentSessionWrapper::set_language(
     const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
   if (info.Length() == 0 || info[0].IsNull()) {
-    std::lock_guard<std::mutex> lock(state_->mutex);
-    state_->language_id.clear();
+    {
+      std::lock_guard<std::mutex> lock(state_->mutex);
+      state_->language_id.clear();
     state_->runtime.clear();
     state_->wasm_path.clear();
     state_->language_name.clear();
@@ -1334,7 +1389,9 @@ Napi::Value DocumentSessionWrapper::set_language(
     state_->syntax_grammar_fingerprint.clear();
     state_->syntax_last_error.clear();
     state_->syntax_last_error_code.clear();
-    state_->syntax_disabled_reason.clear();
+      state_->syntax_disabled_reason.clear();
+    }
+    resolve_drains_if_idle(env, state_);
     return env.Undefined();
   }
   if (!info[0].IsObject())
@@ -1408,8 +1465,9 @@ Napi::Value DocumentSessionWrapper::set_language(
           ? segment_value.As<Napi::String>().Utf8Value()
           : "";
 
-  std::lock_guard<std::mutex> lock(state_->mutex);
-  state_->language_id = descriptor.Get("languageId").As<Napi::String>();
+  {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    state_->language_id = descriptor.Get("languageId").As<Napi::String>();
   state_->runtime = descriptor.Get("runtime").As<Napi::String>();
   state_->wasm_path = wasm_path;
   state_->language_name = language_name;
@@ -1436,7 +1494,9 @@ Napi::Value DocumentSessionWrapper::set_language(
   state_->syntax_grammar_fingerprint.clear();
   state_->syntax_last_error.clear();
   state_->syntax_last_error_code.clear();
-  state_->syntax_disabled_reason.clear();
+    state_->syntax_disabled_reason.clear();
+  }
+  resolve_drains_if_idle(env, state_);
   return env.Undefined();
 }
 
@@ -1492,8 +1552,9 @@ Napi::Value DocumentSessionWrapper::configure_syntax(
           ? segment_value.As<Napi::String>().Utf8Value()
           : std::string();
 
-  std::lock_guard<std::mutex> lock(state_->mutex);
-  state_->language_id = options.Get("languageId").As<Napi::String>();
+  {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    state_->language_id = options.Get("languageId").As<Napi::String>();
   state_->runtime = "wasm";
   state_->wasm_path = wasm_path;
   state_->language_name = language_name;
@@ -1520,7 +1581,9 @@ Napi::Value DocumentSessionWrapper::configure_syntax(
   state_->syntax_grammar_fingerprint.clear();
   state_->syntax_last_error.clear();
   state_->syntax_last_error_code.clear();
-  state_->syntax_disabled_reason.clear();
+    state_->syntax_disabled_reason.clear();
+  }
+  resolve_drains_if_idle(env, state_);
   return env.Undefined();
 }
 
@@ -1809,7 +1872,8 @@ Napi::Value DocumentSessionWrapper::get_query_captures(
             canonical, published_syntax, injection_sources, reader,
             *syntax_analysis, *output_analysis, projection, buffer_revision,
             language_generation, query_range,
-            layered_context, state_->query_snapshot_cache.get(),
+            layered_context, state_->query_snapshot_cache.get(), nullptr,
+            nullptr,
             index_snapshot, query_error, statistics)) {
       const std::string message = query_error.message.empty()
                                       ? "Unable to execute native query"
@@ -2139,6 +2203,31 @@ Napi::Value DocumentSessionWrapper::get_query_requirements(
   return result;
 }
 
+Napi::Value DocumentSessionWrapper::request_highlight_coverage(
+    const Napi::CallbackInfo &info) {
+  return document_engine::request_highlight_coverage(info, state_);
+}
+
+Napi::Value DocumentSessionWrapper::commit_highlight_coverage(
+    const Napi::CallbackInfo &info) {
+  return document_engine::commit_highlight_coverage(info, state_);
+}
+
+Napi::Value DocumentSessionWrapper::abort_highlight_coverage(
+    const Napi::CallbackInfo &info) {
+  return document_engine::abort_highlight_coverage(info, state_);
+}
+
+Napi::Value DocumentSessionWrapper::invalidate_highlight_index(
+    const Napi::CallbackInfo &info) {
+  return document_engine::invalidate_highlight_index(info, state_);
+}
+
+Napi::Value DocumentSessionWrapper::use_synchronous_highlights(
+    const Napi::CallbackInfo &info) {
+  return document_engine::use_synchronous_highlights(info, state_);
+}
+
 Napi::Value DocumentSessionWrapper::get_injection_candidates(
     const Napi::CallbackInfo &info) {
   return state_->injection_engine->get_candidates(info, state_);
@@ -2206,6 +2295,21 @@ Napi::Value DocumentSessionWrapper::get_diagnostics(
   result.Set("pendingJobs", Napi::Number::New(env, state_->pending ? 1 : 0));
   result.Set("activeInjectionJobs",
              Napi::Number::New(env, state_->active_injection_jobs));
+  result.Set("activeHighlightJobs",
+             Napi::Number::New(env, state_->active_highlight_jobs));
+  result.Set("pendingHighlightJobs",
+             Napi::Number::New(
+                 env, state_->pending_highlight_request ? 1 : 0));
+  result.Set("stagedHighlightCommits",
+             Napi::Number::New(env,
+                               state_->staged_highlight_batches.size()));
+  uint64_t staged_highlight_bytes = 0;
+  for (const auto &[_, candidate] : state_->staged_highlight_batches) {
+    if (candidate)
+      staged_highlight_bytes += candidate->retained_bytes;
+  }
+  result.Set("stagedHighlightBytes",
+             Napi::Number::New(env, staged_highlight_bytes));
   result.Set("revisionsRequested",
              Napi::Number::New(env, state_->counters.revisions_requested));
   result.Set("revisionsPublished",
@@ -2468,6 +2572,64 @@ Napi::Value DocumentSessionWrapper::get_diagnostics(
              Napi::Number::New(env, injections.aborted_request_count));
   result.Set("injectionPublishedGeneration",
              Napi::Number::New(env, injections.published_generation));
+  result.Set("injectionTopologyGeneration",
+             Napi::Number::New(env, injections.topology_generation));
+  const HighlightIndexDiagnostics highlights =
+      state_->highlight_index->diagnostics();
+  result.Set("highlightGeneration",
+             Napi::Number::New(env, highlights.generation));
+  result.Set("highlightShardCount",
+             Napi::Number::New(env, highlights.shard_count));
+  result.Set("highlightRetainedBytes",
+             Napi::Number::New(env, highlights.retained_bytes));
+  result.Set("highlightEvictions",
+             Napi::Number::New(env, highlights.evictions));
+  result.Set("highlightRangeCount",
+             Napi::Number::New(env, highlights.range_count));
+  result.Set("highlightZeroLengthRangeCount",
+             Napi::Number::New(env,
+                               highlights.zero_length_range_count));
+  result.Set("highlightRequests",
+             Napi::Number::New(env, state_->counters.highlight_requests));
+  result.Set("highlightCacheHits",
+             Napi::Number::New(env, state_->counters.highlight_cache_hits));
+  result.Set("highlightCacheMisses",
+             Napi::Number::New(env, state_->counters.highlight_cache_misses));
+  result.Set("highlightRequestsCoalesced",
+             Napi::Number::New(
+                 env, state_->counters.highlight_requests_coalesced));
+  result.Set("highlightJobsQueued",
+             Napi::Number::New(env, state_->counters.highlight_jobs_queued));
+  result.Set("highlightJobsCompleted",
+             Napi::Number::New(
+                 env, state_->counters.highlight_jobs_completed));
+  result.Set("highlightJobsCancelled",
+             Napi::Number::New(
+                 env, state_->counters.highlight_jobs_cancelled));
+  result.Set("highlightRequestsSuperseded",
+             Napi::Number::New(
+                 env, state_->counters.highlight_requests_superseded));
+  result.Set("highlightStaleResults",
+             Napi::Number::New(
+                 env, state_->counters.highlight_stale_results));
+  result.Set("highlightShardsPublished",
+             Napi::Number::New(
+                 env, state_->counters.highlight_shards_published));
+  result.Set("highlightCaptureCount",
+             Napi::Number::New(
+                 env, state_->counters.highlight_capture_count));
+  result.Set("highlightFallbackSync",
+             Napi::Number::New(
+                 env, state_->counters.highlight_fallback_sync));
+  result.Set("highlightFailOpen",
+             Napi::Number::New(
+                 env, state_->counters.highlight_fail_open));
+  result.Set("highlightQueueMilliseconds",
+             Napi::Number::New(env, state_->highlight_queue_milliseconds));
+  result.Set("highlightQueryMilliseconds",
+             Napi::Number::New(env, state_->highlight_query_milliseconds));
+  result.Set("highlightCommitMilliseconds",
+             Napi::Number::New(env, state_->highlight_commit_milliseconds));
   return result;
 }
 
@@ -2479,7 +2641,10 @@ Napi::Value DocumentSessionWrapper::drain(const Napi::CallbackInfo &info) {
   {
     std::lock_guard<std::mutex> lock(state_->mutex);
     idle = !state_->active && !state_->pending &&
-           state_->active_injection_jobs == 0;
+           state_->active_injection_jobs == 0 &&
+           state_->active_highlight_jobs == 0 &&
+           !state_->pending_highlight_request &&
+           state_->staged_highlight_batches.empty();
     if (!idle)
       state_->drain_waiters.push_back(deferred);
   }
@@ -2543,6 +2708,8 @@ Napi::Value DocumentSessionWrapper::track_snapshot_leases(
 
 void DocumentSessionWrapper::mark_destroyed(Napi::Env env) {
   state_->destroyed_signal.store(true, std::memory_order_relaxed);
+  state_->highlight_cancellation_signal.fetch_add(
+      1, std::memory_order_relaxed);
   std::unique_ptr<RevisionRequest> pending;
   const SuperstringSnapshotLease *current = nullptr;
   const SuperstringSnapshotLease *syntax = nullptr;
@@ -2560,11 +2727,13 @@ void DocumentSessionWrapper::mark_destroyed(Napi::Env env) {
     state_->analysis.reset();
     state_->syntax_analysis.reset();
     state_->published_syntax.reset();
+    state_->highlight_index->invalidate();
     transient_node_lease_ids.assign(state_->transient_node_lease_ids.begin(),
                                     state_->transient_node_lease_ids.end());
     state_->transient_node_lease_ids.clear();
     state_->injection_engine->clear();
   }
+  cancel_highlight_requests(env, state_, "destroyed");
   if (state_->addon_data != nullptr) {
     for (uint64_t id : transient_node_lease_ids)
       state_->addon_data->release_node_lease(id);

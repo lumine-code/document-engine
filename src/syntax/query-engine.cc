@@ -756,6 +756,10 @@ bool execute_program(const Program &program, const TSTree *tree,
       output.capture_names.push_back(resolved.name);
       capture_name_ids.emplace(resolved.name, resolved_name_id);
     }
+    if (output.captures.size() >= resolution.capture_limit) {
+      output.exceeded_match_limit = true;
+      break;
+    }
     output.captures.push_back(QueryCaptureRecord{
         resolved_name_id,
         match.pattern_index,
@@ -778,7 +782,7 @@ bool execute_program(const Program &program, const TSTree *tree,
         end_byte / 2u});
     output.accepted_capture_count++;
   }
-  output.exceeded_match_limit = ts_query_cursor_did_exceed_match_limit(cursor);
+  output.exceeded_match_limit |= ts_query_cursor_did_exceed_match_limit(cursor);
   output.scope_statistics = scope_resolver.statistics();
   ts_query_cursor_delete(cursor);
   return true;
@@ -1065,6 +1069,30 @@ NativeQueryEngine::scope_config_keys(const std::string &query_type) const {
     collect(metadata.refuted_properties);
   }
   return {keys.begin(), keys.end()};
+}
+
+bool NativeQueryEngine::query_may_escape_node_range(
+    const std::string &query_type) const {
+  const char *canonical = canonical_query_type(query_type);
+  if (canonical == nullptr)
+    return false;
+  const auto program = std::find_if(
+      impl_->programs.begin(), impl_->programs.end(),
+      [&](const Program &candidate) { return candidate.query_type == canonical; });
+  if (program == impl_->programs.end())
+    return false;
+  for (const QueryPatternMetadata &metadata : program->patterns) {
+    for (const QueryProperty &property : metadata.set_properties) {
+      const std::string_view name =
+          property.name.starts_with("adjust.")
+              ? std::string_view(property.name).substr(7)
+              : std::string_view(property.name);
+      if (name == "startAt" || name == "endAt" || name == "offsetStart" ||
+          name == "offsetEnd")
+        return true;
+    }
+  }
+  return false;
 }
 
 } // namespace document_engine

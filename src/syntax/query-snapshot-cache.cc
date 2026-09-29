@@ -26,7 +26,8 @@ std::string QuerySnapshotCache::key_for(
   output << ':' << range.start_row << ':' << range.start_column << ':'
          << range.end_row << ':' << range.end_column << ':'
          << resolution.resolve_scopes << ':' << resolution.interpolate_names
-         << ':' << resolution.injection_depth << ':'
+         << ':' << resolution.injection_depth << ':' << resolution.capture_limit
+         << ':'
          << resolution.local_ranges_enabled << ':';
   for (const auto &[name, value] : resolution.config) {
     append_string(output, name);

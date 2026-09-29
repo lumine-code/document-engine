@@ -24,6 +24,7 @@ struct QueryResolutionContext {
   bool resolve_scopes = true;
   bool interpolate_names = false;
   uint32_t injection_depth = 0;
+  uint32_t capture_limit = UINT32_MAX;
   std::map<std::string, QueryConfigValue> config;
   bool local_ranges_enabled = false;
   std::vector<std::pair<uint32_t, uint32_t>> local_ranges;

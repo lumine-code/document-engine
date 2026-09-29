@@ -525,3 +525,81 @@ test('resolves query-defined language aliases before parsing the child layer', a
 
   await session.destroy()
 })
+
+test('omits the query-defined child language scope when requested', async () => {
+  const source = '<script>const answer = 42</script>\n'
+  const buffer = new TextBuffer(source)
+  const session = new DocumentSession()
+  session.configureSyntax({
+    languageId: 'text.html.basic',
+    wasmPath: htmlWasm,
+    languageName: 'html',
+    queries: {
+      highlightsQuery: fs.readFileSync(htmlHighlights, 'utf8'),
+      injectionsQuery: String.raw`
+        (script_element
+          (raw_text) @injection.content
+          (#set! injection.language "javascript")
+          (#set! injection.language-scope "none"))
+      `,
+    },
+  })
+  await apply(session, buffer, 1)
+  const tags = revisionTags(session)
+  const candidates = await session.getInjectionCandidates({
+    ...tags,
+    injectionPointGeneration: 1,
+    grammars: [],
+  })
+  const resolution = session.applyQueryLanguageDescriptors({
+    ...tags,
+    requestId: candidates.requestId,
+    injectionPointGeneration: 1,
+    descriptors: [
+      {
+        alias: 'javascript',
+        grammar: descriptor(
+          'source.js',
+          javascriptWasm,
+          'javascript',
+          javascriptHighlights,
+        ),
+      },
+    ],
+  })
+  assert.equal(resolution.accepted, true)
+  const publication = await session.applyInjectionResultBatch({
+    ...tags,
+    requestId: candidates.requestId,
+    injectionPointGeneration: 1,
+    batchIndex: 0,
+    isFinal: true,
+    results: [],
+  })
+  assert.equal(publication.accepted, true)
+
+  const result = session.getQueryCaptures('highlightsQuery', 0, 2, {
+    resolveScopes: true,
+    interpolateNames: true,
+    includeLanguageScopes: true,
+  })
+  const captures = unpack(result)
+  const childLayer = result.layers.find(
+    (layer) => layer.grammarId === 'source.js' && layer.depth === 1,
+  )
+  assert.ok(childLayer)
+  assert.deepEqual(childLayer.rangeScopes, [[]])
+  assert.ok(
+    captures.some(
+      (capture) => capture.grammarId === 'source.js' && capture.depth === 1,
+    ),
+  )
+  assert.equal(
+    captures.some(
+      (capture) => capture.name === 'source.js' && (capture.flags & 1) !== 0,
+    ),
+    false,
+  )
+
+  await session.destroy()
+})

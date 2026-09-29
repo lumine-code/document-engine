@@ -3,6 +3,8 @@
 #include "bindings/addon-data.h"
 #include "revision-projection.h"
 #include "snapshot-lease.h"
+#include "syntax/highlight-index.h"
+#include "syntax/injection-engine.h"
 
 #include <algorithm>
 #include <atomic>
@@ -10,6 +12,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -307,6 +310,9 @@ Napi::Function DisplayViewWrapper::init(Napi::Env env) {
            "getIndexedSummary"),
        InstanceMethod<&DisplayViewWrapper::buffer_rows_for_screen_rows>(
            "bufferRowsForScreenRows"),
+       InstanceMethod<
+           &DisplayViewWrapper::highlight_shard_starts_for_screen_rows>(
+           "_highlightShardStartsForScreenRows"),
        InstanceMethod<&DisplayViewWrapper::translate_screen_column_block>(
            "translateScreenColumnBlock"),
        InstanceMethod<&DisplayViewWrapper::build_render_plan>("buildRenderPlan"),
@@ -1048,6 +1054,45 @@ Napi::Value DisplayViewWrapper::buffer_rows_for_screen_rows(
   return rows;
 }
 
+Napi::Value DisplayViewWrapper::highlight_shard_starts_for_screen_rows(
+    const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  uint64_t start = 0;
+  uint64_t end = 0;
+  if (info.Length() < 2 || !read_uint64(info[0], &start) ||
+      !read_uint64(info[1], &end) || end < start)
+    return throw_type_error(
+        env, "_highlightShardStartsForScreenRows expects an ordered range",
+        "ERR_INVALID_VIEWPORT");
+  const SuperstringSnapshotLease *lease = nullptr;
+  std::shared_ptr<const SnapshotAnalysis> analysis;
+  if (!ensure_index(env, &lease, &analysis))
+    return env.Undefined();
+  end = std::min<uint64_t>(end, state_->index->row_count());
+  start = std::min<uint64_t>(start, end);
+  std::set<uint32_t> starts;
+  auto include = [&](uint64_t row) {
+    starts.insert(highlight_shard_start(static_cast<uint32_t>(
+        std::min<uint64_t>(row, UINT32_MAX))));
+  };
+  for (uint64_t row = start; row < end; row++) {
+    const ScreenRow *screen_row = state_->index->row(row);
+    if (screen_row == nullptr)
+      continue;
+    include(screen_row->buffer_start.row);
+    include(screen_row->buffer_end.row);
+    for (const DisplaySpan &span : screen_row->spans) {
+      include(span.start.row);
+      include(span.end.row);
+    }
+  }
+  Napi::Uint32Array result = Napi::Uint32Array::New(env, starts.size());
+  uint32_t index = 0;
+  for (uint32_t shard : starts)
+    result[index++] = shard;
+  return result;
+}
+
 Napi::Value DisplayViewWrapper::translate_screen_column_block(
     const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
@@ -1111,8 +1156,94 @@ bool DisplayViewWrapper::collect_render_plan(Napi::Env env, uint64_t start,
   plan->lines.reserve(static_cast<size_t>(end - start));
   uint64_t copied = 0;
   plan->indexed_buffer_row_count = 0;
+  uint32_t highlight_start_row = 0;
+  uint32_t highlight_end_row = 0;
+  std::vector<uint32_t> highlight_shards;
+  std::unordered_set<uint32_t> seen_highlight_shards;
+  auto include_highlight_row = [&](uint64_t raw_row) {
+    const uint32_t row = static_cast<uint32_t>(
+        std::min<uint64_t>(raw_row, UINT32_MAX));
+    const uint32_t shard = highlight_shard_start(row);
+    if (seen_highlight_shards.insert(shard).second)
+      highlight_shards.push_back(shard);
+  };
+  if (start < end) {
+    if (const ScreenRow *first = state_->index->row(start)) {
+      highlight_start_row = static_cast<uint32_t>(std::min<uint64_t>(
+          first->buffer_start.row, UINT32_MAX));
+    }
+    for (uint64_t row = start; row < end; row++) {
+      if (const ScreenRow *screen_row = state_->index->row(row)) {
+        include_highlight_row(screen_row->buffer_start.row);
+        include_highlight_row(screen_row->buffer_end.row);
+        for (const DisplaySpan &span : screen_row->spans) {
+          include_highlight_row(span.start.row);
+          include_highlight_row(span.end.row);
+        }
+        const uint64_t last_buffer_row =
+            std::max(screen_row->buffer_start.row,
+                     screen_row->buffer_end.row);
+        highlight_end_row = static_cast<uint32_t>(std::min<uint64_t>(
+            last_buffer_row + 1, UINT32_MAX));
+      }
+    }
+  }
+  if (start < end && highlight_end_row < analysis->line_starts.size())
+    highlight_shards.push_back(highlight_shard_start(highlight_end_row));
+  std::sort(highlight_shards.begin(), highlight_shards.end());
+  highlight_shards.erase(
+      std::unique(highlight_shards.begin(), highlight_shards.end()),
+      highlight_shards.end());
+  std::vector<ScopedRange> shared_highlights;
+  const std::vector<ScopedRange> *highlights = &state_->highlight_ranges;
+  uint64_t highlight_syntax_revision = state_->highlight_syntax_revision;
+  {
+    std::lock_guard<std::mutex> lock(state_->session->mutex);
+    const HighlightIndexTags tags = state_->session->highlight_index->tags();
+    const InjectionEngineDiagnostics injections =
+        state_->session->injection_engine->diagnostics();
+    const bool tags_current = state_->session->highlight_index->active_for(tags) &&
+        tags.buffer_revision == state_->session->buffer_revision &&
+        tags.syntax_revision == state_->session->syntax_revision &&
+        tags.syntax_revision == tags.buffer_revision &&
+        tags.language_generation == state_->session->language_generation &&
+        tags.injection_generation == injections.topology_generation;
+    plan->highlight_generation =
+        state_->session->highlight_index->generation();
+    if (!state_->session->async_highlight_mode &&
+        state_->highlight_buffer_revision == state_->session->buffer_revision &&
+        state_->highlight_syntax_revision == state_->session->syntax_revision) {
+      plan->highlight_coverage_complete = true;
+      plan->highlight_coverage_start_row = highlight_start_row;
+      plan->highlight_coverage_end_row = highlight_end_row;
+    } else if (state_->session->language_id.empty()) {
+      highlights = &shared_highlights;
+      highlight_syntax_revision = 0;
+      plan->highlight_coverage_complete = true;
+      plan->highlight_coverage_start_row = highlight_start_row;
+      plan->highlight_coverage_end_row = highlight_end_row;
+    } else if (state_->session->async_highlight_mode && tags_current &&
+               start == end) {
+      highlights = &shared_highlights;
+      highlight_syntax_revision = tags.syntax_revision;
+      plan->highlight_coverage_complete = true;
+    } else if (state_->session->async_highlight_mode && tags_current &&
+        !highlight_shards.empty() &&
+        state_->session->highlight_index->collect_shards(
+            highlight_shards, tags,
+            shared_highlights)) {
+      highlights = &shared_highlights;
+      highlight_syntax_revision = tags.syntax_revision;
+      plan->highlight_coverage_complete = true;
+      plan->highlight_coverage_start_row = highlight_start_row;
+      plan->highlight_coverage_end_row = highlight_end_row;
+    } else {
+      highlights = &shared_highlights;
+      highlight_syntax_revision = 0;
+    }
+  }
   RenderPlanBuilder builder(reader, *state_->index, state_->render_style,
-                            state_->highlight_ranges);
+                            *highlights);
   for (uint64_t row = start; row < end; row++) {
     const ScreenRow *screen_row = state_->index->row(row);
     RenderedLine rendered = builder.build_line(row, copied);
@@ -1143,7 +1274,7 @@ bool DisplayViewWrapper::collect_render_plan(Napi::Env env, uint64_t start,
     std::lock_guard<std::mutex> lock(state_->session->mutex);
     state_->session->counters.viewport_utf16_copied += copied;
     plan->buffer_revision = state_->session->buffer_revision;
-    plan->syntax_revision = state_->highlight_syntax_revision;
+    plan->syntax_revision = highlight_syntax_revision;
   }
   plan->display_revision = state_->display_revision;
   plan->fold_generation = state_->fold_generation;
@@ -1191,6 +1322,14 @@ Napi::Value DisplayViewWrapper::build_render_plan(
            Napi::Number::New(env, data.display_revision));
   plan.Set("foldGeneration",
            Napi::Number::New(env, data.fold_generation));
+  plan.Set("highlightGeneration",
+           Napi::Number::New(env, data.highlight_generation));
+  plan.Set("highlightCoverageComplete",
+           Napi::Boolean::New(env, data.highlight_coverage_complete));
+  plan.Set("highlightCoverageStartRow",
+           Napi::Number::New(env, data.highlight_coverage_start_row));
+  plan.Set("highlightCoverageEndRow",
+           Napi::Number::New(env, data.highlight_coverage_end_row));
   plan.Set("indexedBufferRowCount",
            Napi::Number::New(env, data.indexed_buffer_row_count));
   plan.Set("lines", lines);
@@ -1273,6 +1412,14 @@ Napi::Value DisplayViewWrapper::build_render_plan_packed(
            Napi::Number::New(env, data.display_revision));
   plan.Set("foldGeneration",
            Napi::Number::New(env, data.fold_generation));
+  plan.Set("highlightGeneration",
+           Napi::Number::New(env, data.highlight_generation));
+  plan.Set("highlightCoverageComplete",
+           Napi::Boolean::New(env, data.highlight_coverage_complete));
+  plan.Set("highlightCoverageStartRow",
+           Napi::Number::New(env, data.highlight_coverage_start_row));
+  plan.Set("highlightCoverageEndRow",
+           Napi::Number::New(env, data.highlight_coverage_end_row));
   plan.Set("indexedBufferRowCount",
            Napi::Number::New(env, data.indexed_buffer_row_count));
   plan.Set("text", Napi::String::New(env, text.data(), text.size()));

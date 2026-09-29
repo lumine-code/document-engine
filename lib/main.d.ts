@@ -265,6 +265,11 @@ export interface RenderPlan {
   syntaxRevision: number
   displayRevision: number
   foldGeneration: number
+  highlightGeneration: number
+  highlightCoverageComplete: boolean
+  /** Visible viewport's buffer-row envelope; hidden folded rows inside it need not be indexed. */
+  highlightCoverageStartRow: number
+  highlightCoverageEndRow: number
   indexedBufferRowCount: number
   lines: RenderLine[]
 }
@@ -275,6 +280,11 @@ export interface PackedRenderPlan {
   syntaxRevision: number
   displayRevision: number
   foldGeneration: number
+  highlightGeneration: number
+  highlightCoverageComplete: boolean
+  /** Visible viewport's buffer-row envelope; hidden folded rows inside it need not be indexed. */
+  highlightCoverageStartRow: number
+  highlightCoverageEndRow: number
   indexedBufferRowCount: number
   /** All viewport line text concatenated as UTF-16. */
   text: string
@@ -372,6 +382,11 @@ export declare class DisplayView {
   getRightmostScreenPosition(): Point
   getIndexedSummary(bufferRowCount: number): IndexedDisplaySummary
   bufferRowsForScreenRows(startRow: number, endRow: number): Uint32Array
+  /** @internal Native highlight shards intersecting visible source/fold spans. */
+  _highlightShardStartsForScreenRows(
+    startRow: number,
+    endRow: number,
+  ): Uint32Array
   /** Packed stride 5: [startRow, startColumn, endRow, endColumn, screenColumnOrUint32Max]. */
   translateScreenColumnBlock(
     startRow: number,
@@ -426,6 +441,64 @@ export declare class DocumentSession {
     scopeConfigKeys: string[]
     scopeConfigKeysByLanguage: Record<string, string[]>
   }
+  requestHighlightCoverage(
+    startRow: number,
+    endRow: number,
+    options: {
+      contextGeneration: number
+      scopeConfig?: Record<string, null | boolean | number | string>
+      scopeConfigsByLanguage?: Record<
+        string,
+        Record<string, null | boolean | number | string>
+      >
+      /** Optional sorted native 128-row shards for a folded viewport. */
+      shardStarts?: Uint32Array
+    },
+  ): Promise<{
+    accepted: boolean
+    published: boolean
+    needsCommit: boolean
+    fallbackSync: boolean
+    permanentIncomplete: boolean
+    reason?: string
+    requestId: number
+    bufferRevision: number
+    syntaxRevision: number
+    languageGeneration: number
+    injectionGeneration: number
+    contextGeneration: number
+    coverageStartRow: number
+    coverageEndRow: number
+    highlightGeneration: number
+    captureNames: string[]
+    captureGrammarIds: string[]
+    queueMilliseconds?: number
+    queryMilliseconds?: number
+  }>
+  commitHighlightCoverage(
+    requestId: number,
+    scopeIds: Uint32Array,
+  ): {
+    accepted: boolean
+    published: boolean
+    needsCommit: false
+    fallbackSync: boolean
+    permanentIncomplete: boolean
+    reason?: string
+    requestId: number
+    bufferRevision: number
+    syntaxRevision: number
+    languageGeneration: number
+    injectionGeneration: number
+    contextGeneration: number
+    coverageStartRow: number
+    coverageEndRow: number
+    highlightGeneration: number
+  }
+  abortHighlightCoverage(requestId: number): boolean
+  invalidateHighlightIndex(): number
+  /** @internal Forces the compatibility display path for this session. */
+  useSynchronousHighlights(): void
   getInjectionCandidates(
     request: InjectionRevisionTags & InjectionRegistrationManifest,
   ): Promise<InjectionCandidateBatch>
@@ -506,6 +579,7 @@ export declare const capabilities: Readonly<{
   snapshotLeaseAbi: number
   nativeDisplayIndex: boolean
   nativeDisplayParity: boolean
+  nativeAsyncHighlights: boolean
   nativeDynamicInjections: boolean
   nativeInjectionChildParsing: boolean
   nativeLayeredQueries: boolean

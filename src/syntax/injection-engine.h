@@ -59,6 +59,7 @@ struct InjectionLayerRecord {
   bool newlines_between = false;
   bool cover_shallower_scopes = false;
   bool query_defined = false;
+  bool include_language_scope = true;
   bool syntax_parsed = false;
   bool syntax_root_has_error = false;
   std::string syntax_error_code;
@@ -96,6 +97,7 @@ struct InjectionEngineDiagnostics {
   uint64_t stale_request_count = 0;
   uint64_t aborted_request_count = 0;
   uint64_t published_generation = 0;
+  uint64_t topology_generation = 0;
 };
 
 struct InjectionQuerySource {

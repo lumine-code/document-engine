@@ -99,6 +99,19 @@ struct SessionCounters {
   uint64_t query_projected_captures = 0;
   uint64_t query_stale_captures = 0;
   uint64_t query_covered_captures = 0;
+  uint64_t highlight_requests = 0;
+  uint64_t highlight_cache_hits = 0;
+  uint64_t highlight_cache_misses = 0;
+  uint64_t highlight_requests_coalesced = 0;
+  uint64_t highlight_jobs_queued = 0;
+  uint64_t highlight_jobs_completed = 0;
+  uint64_t highlight_jobs_cancelled = 0;
+  uint64_t highlight_requests_superseded = 0;
+  uint64_t highlight_stale_results = 0;
+  uint64_t highlight_shards_published = 0;
+  uint64_t highlight_capture_count = 0;
+  uint64_t highlight_fallback_sync = 0;
+  uint64_t highlight_fail_open = 0;
 };
 
 } // namespace document_engine

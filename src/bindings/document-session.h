@@ -22,9 +22,12 @@ struct RevisionRequest;
 struct DisplayViewState;
 class DocumentSessionWrapper;
 class InjectionEngine;
+class NativeHighlightIndex;
 class PublishedSyntaxSnapshot;
 class QuerySnapshotCache;
 class SyntaxBackend;
+struct HighlightCandidateBatch;
+struct HighlightCoverageRequest;
 struct SyntaxQuerySnapshot;
 
 class NativeJobControl {
@@ -58,6 +61,8 @@ struct SessionState {
   bool destroyed = false;
   bool active = false;
   uint32_t active_injection_jobs = 0;
+  uint32_t active_highlight_jobs = 0;
+  bool async_highlight_mode = false;
   bool owner_referenced = false;
   DocumentSessionWrapper *owner = nullptr;
   uint32_t worker_delay_ms = 0;
@@ -81,9 +86,16 @@ struct SessionState {
   std::atomic<bool> environment_cleanup_signal{false};
   std::atomic<uint64_t> latest_requested_signal{0};
   std::atomic<uint64_t> language_generation_signal{0};
+  std::atomic<uint64_t> highlight_cancellation_signal{0};
   std::unique_ptr<SyntaxBackend> syntax_backend;
   std::unique_ptr<InjectionEngine> injection_engine;
   std::unique_ptr<QuerySnapshotCache> query_snapshot_cache;
+  std::unique_ptr<NativeHighlightIndex> highlight_index;
+  std::shared_ptr<HighlightCoverageRequest> active_highlight_request;
+  std::shared_ptr<HighlightCoverageRequest> pending_highlight_request;
+  std::map<uint64_t, std::shared_ptr<HighlightCandidateBatch>>
+      staged_highlight_batches;
+  uint64_t next_highlight_request_id = 1;
   std::vector<std::weak_ptr<DisplayViewState>> display_views;
   std::unordered_set<uint64_t> transient_node_lease_ids;
 
@@ -107,6 +119,9 @@ struct SessionState {
   double query_compile_milliseconds = 0;
   double query_execute_milliseconds = 0;
   double synchronous_analysis_milliseconds = 0;
+  double highlight_queue_milliseconds = 0;
+  double highlight_query_milliseconds = 0;
+  double highlight_commit_milliseconds = 0;
   uint64_t query_pattern_count = 0;
   uint64_t query_capture_count = 0;
   uint64_t query_language_segment_substitutions = 0;
@@ -131,6 +146,10 @@ void finish_injection_job(Napi::Env env,
                           const std::shared_ptr<SessionState> &state);
 void finish_injection_job_without_js(
     const std::shared_ptr<SessionState> &state);
+void finish_highlight_job(Napi::Env env,
+                          const std::shared_ptr<SessionState> &state);
+void resolve_session_drains_if_idle(
+    Napi::Env env, const std::shared_ptr<SessionState> &state);
 void begin_environment_cleanup(
     const std::shared_ptr<SessionState> &state);
 bool environment_cleanup_complete(
@@ -176,6 +195,11 @@ private:
   Napi::Value configure_syntax(const Napi::CallbackInfo &info);
   Napi::Value get_query_captures(const Napi::CallbackInfo &info);
   Napi::Value get_query_requirements(const Napi::CallbackInfo &info);
+  Napi::Value request_highlight_coverage(const Napi::CallbackInfo &info);
+  Napi::Value commit_highlight_coverage(const Napi::CallbackInfo &info);
+  Napi::Value abort_highlight_coverage(const Napi::CallbackInfo &info);
+  Napi::Value invalidate_highlight_index(const Napi::CallbackInfo &info);
+  Napi::Value use_synchronous_highlights(const Napi::CallbackInfo &info);
   Napi::Value get_injection_candidates(const Napi::CallbackInfo &info);
   Napi::Value resolve_injection_node(const Napi::CallbackInfo &info);
   Napi::Value resolve_query_node(const Napi::CallbackInfo &info);

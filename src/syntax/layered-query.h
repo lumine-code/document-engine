@@ -34,6 +34,8 @@ bool execute_layered_query(
     uint64_t buffer_revision, uint64_t language_generation,
     const QueryRange &range, const LayeredQueryContext &context,
     QuerySnapshotCache *cache,
+    QueryCancellationFunction cancellation,
+    void *cancellation_payload,
     std::shared_ptr<const QueryIndexSnapshot> &snapshot,
     QueryErrorInfo &error, QueryRunStatistics &statistics);
 

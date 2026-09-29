@@ -325,6 +325,7 @@ struct QueryInjectionProposal {
   bool target_parent = false;
   bool include_children = false;
   bool combined = false;
+  bool include_language_scope = true;
   std::vector<NodeRangeSpec> content;
 };
 
@@ -431,6 +432,7 @@ struct InjectionEngine::Impl {
   uint64_t stale_request_count = 0;
   uint64_t aborted_request_count = 0;
   uint64_t published_generation = 0;
+  uint64_t topology_generation = 0;
   uint64_t query_language_resolution_count = 0;
   uint64_t query_language_rejection_count = 0;
   // Keep the last finalized layer count across publish_root's query-only
@@ -756,7 +758,8 @@ void apply_query_grammar(InjectionLayerRecord &layer,
   layer.language_segment = grammar.language_segment;
   layer.query_paths = grammar.query_paths;
   for (InjectionRangeRecord &range : layer.ranges) {
-    if (range.scopes.empty() && !grammar.language_id.empty())
+    if (layer.include_language_scope && range.scopes.empty() &&
+        !grammar.language_id.empty())
       range.scopes.push_back(grammar.language_id);
   }
 }
@@ -923,6 +926,8 @@ public:
     }
     const bool topology_changed = publish_topology(
         engine_->impl_->published_layer_count, *index_);
+    if (topology_changed)
+      engine_->impl_->topology_generation++;
     engine_->impl_->published_index = index_;
     engine_->impl_->published_generation++;
     engine_->impl_->candidate_count = 0;
@@ -1022,6 +1027,7 @@ void InjectionEngine::publish_root(
                               : proposal.language_name;
     layer.include_children = proposal.include_children;
     layer.query_defined = true;
+    layer.include_language_scope = proposal.include_language_scope;
     layer.ranges =
         included_ranges(proposal.content, proposal.include_children, analysis);
     if (layer.ranges.empty())
@@ -1068,6 +1074,7 @@ InjectionEngineDiagnostics InjectionEngine::diagnostics() const {
   result.stale_request_count = impl_->stale_request_count;
   result.aborted_request_count = impl_->aborted_request_count;
   result.published_generation = impl_->published_generation;
+  result.topology_generation = impl_->topology_generation;
   result.query_language_resolution_count =
       impl_->query_language_resolution_count;
   result.query_language_rejection_count =
@@ -1175,6 +1182,8 @@ Napi::Value InjectionEngine::queue_child_parse(
     finalize_index_counts(*request.staged_index);
     const bool topology_changed =
         publish_topology(impl_->published_layer_count, *request.staged_index);
+    if (topology_changed)
+      impl_->topology_generation++;
     impl_->published_index = request.staged_index;
     impl_->published_generation++;
     impl_->candidate_count = 0;
@@ -2857,6 +2866,9 @@ std::vector<QueryInjectionProposal> query_injection_proposals(
     const bool include_children =
         property_present(metadata, "injection.include-children");
     const bool combined = property_present(metadata, "injection.combined");
+    const bool include_language_scope =
+        trim_ascii(property_value(metadata, "injection.language-scope")) !=
+        "none";
 
     QueryInjectionProposal proposal;
     proposal.parent_grammar_id = grammar_id;
@@ -2865,6 +2877,7 @@ std::vector<QueryInjectionProposal> query_injection_proposals(
     proposal.target_parent = target_parent;
     proposal.include_children = include_children;
     proposal.combined = combined;
+    proposal.include_language_scope = include_language_scope;
     for (const QueryCaptureRecord *capture : match.content)
       proposal.content.push_back(
           node_range_spec(*syntax, *capture, include_children));

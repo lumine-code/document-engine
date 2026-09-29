@@ -92,6 +92,10 @@ private:
     uint64_t syntax_revision = 0;
     uint64_t display_revision = 0;
     uint64_t fold_generation = 0;
+    uint64_t highlight_generation = 0;
+    uint32_t highlight_coverage_start_row = 0;
+    uint32_t highlight_coverage_end_row = 0;
+    bool highlight_coverage_complete = false;
     uint64_t indexed_buffer_row_count = 0;
     std::vector<RenderPlanLineData> lines;
   };
@@ -107,6 +111,8 @@ private:
   Napi::Value get_rightmost_screen_position(const Napi::CallbackInfo &info);
   Napi::Value get_indexed_summary(const Napi::CallbackInfo &info);
   Napi::Value buffer_rows_for_screen_rows(const Napi::CallbackInfo &info);
+  Napi::Value highlight_shard_starts_for_screen_rows(
+      const Napi::CallbackInfo &info);
   Napi::Value translate_screen_column_block(const Napi::CallbackInfo &info);
   Napi::Value build_render_plan(const Napi::CallbackInfo &info);
   Napi::Value build_render_plan_packed(const Napi::CallbackInfo &info);
