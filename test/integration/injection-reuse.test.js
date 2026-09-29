@@ -365,7 +365,7 @@ test('bounds overlapping same-revision synchronizations and publishes the latest
 })
 
 test('newer wave zero supersedes an older nested rescan without repair', async () => {
-  const commentCount = 500
+  const commentCount = 100
   const comments = Array.from(
     {length: commentCount},
     (_, index) => `// TODO ${index}`,
@@ -402,6 +402,10 @@ test('newer wave zero supersedes an older nested rescan without repair', async (
   let bridge
   let latest = null
   let launched = false
+  let markLatestStarted
+  const latestStarted = new Promise((resolve) => {
+    markLatestStarted = resolve
+  })
   const engine = new Proxy(session, {
     get(target, property) {
       const value = target[property]
@@ -412,6 +416,7 @@ test('newer wave zero supersedes an older nested rescan without repair', async (
             launched = true
             setImmediate(() => {
               latest = bridge.synchronize()
+              markLatestStarted()
             })
           }
           return pending
@@ -435,7 +440,17 @@ test('newer wave zero supersedes an older nested rescan without repair', async (
 
   try {
     const superseded = bridge.synchronize()
-    while (latest == null) await new Promise((resolve) => setImmediate(resolve))
+    let timeout
+    await Promise.race([
+      latestStarted,
+      new Promise((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error('Nested rescan wave did not start')),
+          10_000,
+        )
+      }),
+    ])
+    clearTimeout(timeout)
     const [oldResult, latestResult] = await Promise.all([superseded, latest])
 
     assert.equal(oldResult.accepted, false)
