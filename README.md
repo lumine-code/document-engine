@@ -2,6 +2,9 @@
 
 Builds native syntax and display state for editor documents.
 
+> [!WARNING]
+> **This package is deprecated.** [Lumine](https://github.com/lumine-code/lumine) no longer depends on this native document runtime. This repository is archived and no longer maintained.
+
 `@lumine-code/document-engine` is the native derived-state boundary between Superstring snapshots and the editor's JavaScript compatibility facades.
 
 ## Features
