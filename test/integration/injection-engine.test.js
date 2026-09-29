@@ -264,6 +264,7 @@ test('packs native candidates with resolvable handles', async () => {
     ],
   })
   assert.equal(batch.queryLayerCount, 0)
+  assert.equal(batch.candidateStride, 5)
   for (const field of [
     'candidateQueueMilliseconds',
     'candidateScanMilliseconds',
@@ -274,6 +275,10 @@ test('packs native candidates with resolvable handles', async () => {
   }
   const candidates = decodeCandidates(batch)
   assert.equal(candidates.length, 2)
+  assert.deepEqual(
+    candidates.map(({depth}) => depth),
+    [0, 0],
+  )
   assert.deepEqual(
     candidates.map(
       (candidate) => session.resolveInjectionNode(candidate, tags).text,

@@ -719,7 +719,7 @@ public:
 
     uint32_t next_candidate_id = 1;
     Napi::Uint32Array packed =
-        Napi::Uint32Array::New(env, items_.size() * 4);
+        Napi::Uint32Array::New(env, items_.size() * 5);
     uint32_t offset = 0;
     for (const CandidateScanItem &item : items_) {
       const uint32_t candidate_id = next_candidate_id++;
@@ -730,6 +730,7 @@ public:
       packed[offset++] = grammar_index;
       packed[offset++] = kind_index;
       packed[offset++] = item.node_handle;
+      packed[offset++] = item.depth;
       InjectionCandidateRecord record{candidate_id,
                                       item.syntax,
                                       item.node_handle,
@@ -758,7 +759,7 @@ public:
                  Napi::Number::New(env, queue_milliseconds_));
     response.Set("candidateScanMilliseconds",
                  Napi::Number::New(env, scan_milliseconds_));
-    response.Set("candidateStride", Napi::Number::New(env, 4));
+    response.Set("candidateStride", Napi::Number::New(env, 5));
     response.Set("candidates", packed);
     Napi::Array grammar_array = Napi::Array::New(env, grammar_ids.size());
     for (uint32_t index = 0; index < grammar_ids.size(); index++)

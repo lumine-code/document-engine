@@ -165,8 +165,8 @@ export interface InjectionCandidateBatch extends InjectionRevisionTags {
   reason?: string
   requestId: number
   injectionPointGeneration: number
-  candidateStride: 4
-  /** [candidateId, grammarIdIndex, kindIndex, nodeHandle] */
+  candidateStride: 4 | 5
+  /** Stride 4: [candidateId, grammarIdIndex, kindIndex, nodeHandle]. Stride 5 adds depth. */
   candidates: Uint32Array
   grammarIds: string[]
   kinds: string[]
