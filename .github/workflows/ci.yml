@@ -90,7 +90,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: lumine-code/lumine
-          ref: 9bcb41634e68a4f51ea738f9ca7ed57c2323a44a
+          ref: f12ca627f7e02c37240d4a17f0d1190d05516c28
           path: lumine
       - name: Check out Season grammar descriptor reader
         uses: actions/checkout@v7
@@ -208,7 +208,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: lumine-code/lumine
-          ref: 9bcb41634e68a4f51ea738f9ca7ed57c2323a44a
+          ref: f12ca627f7e02c37240d4a17f0d1190d05516c28
           path: lumine
       - uses: actions/setup-node@v7
         with:
@@ -251,7 +251,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: lumine-code/lumine
-          ref: 9bcb41634e68a4f51ea738f9ca7ed57c2323a44a
+          ref: f12ca627f7e02c37240d4a17f0d1190d05516c28
           path: lumine
       - name: Check out JavaScript grammar
         uses: actions/checkout@v7
@@ -352,7 +352,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: lumine-code/lumine
-          ref: 9bcb41634e68a4f51ea738f9ca7ed57c2323a44a
+          ref: f12ca627f7e02c37240d4a17f0d1190d05516c28
           path: lumine
       - name: Check out Season grammar descriptor reader
         uses: actions/checkout@v7
