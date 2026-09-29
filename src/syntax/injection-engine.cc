@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -28,6 +29,14 @@ std::atomic<uint64_t> next_snapshot_lease_reference_id{1};
 std::atomic<uint64_t> next_published_syntax_identity{1};
 
 namespace {
+
+using InjectionClock = std::chrono::steady_clock;
+
+double elapsed_milliseconds(InjectionClock::time_point started_at) {
+  return std::chrono::duration<double, std::milli>(InjectionClock::now() -
+                                                   started_at)
+      .count();
+}
 
 void set_error_code(Napi::Error &error, const char *code) {
   error.Value().Set("code", Napi::String::New(error.Env(), code));
@@ -359,6 +368,8 @@ struct CandidateScanItem {
   uint32_t node_handle = 0;
   uint64_t parent_layer_id = 0;
   uint32_t depth = 0;
+  uint32_t start_byte = 0;
+  uint32_t end_byte = 0;
 };
 
 struct CandidateSource {
@@ -422,6 +433,9 @@ struct InjectionEngine::Impl {
   uint64_t published_generation = 0;
   uint64_t query_language_resolution_count = 0;
   uint64_t query_language_rejection_count = 0;
+  // Keep the last finalized layer count across publish_root's query-only
+  // staging index so the bridge can distinguish stable zero from a removal.
+  uint64_t published_layer_count = 0;
   std::unordered_map<uint64_t, std::shared_ptr<SyntaxBackend>> child_backends;
   std::unordered_map<std::string, ParsedGrammarDescriptor> query_grammars;
   std::unordered_set<std::string> query_rejected_aliases;
@@ -463,7 +477,8 @@ public:
         session_(std::move(session)), engine_(engine),
         sources_(std::move(sources)), manifest_(std::move(manifest)), tags_(tags),
         injection_point_generation_(injection_point_generation),
-        cancellation_{session_.get(), tags}, job_(std::move(job)) {}
+        cancellation_{session_.get(), tags}, job_(std::move(job)),
+        queued_at_(InjectionClock::now()) {}
 
   Napi::Promise promise() const { return deferred_.Promise(); }
 
@@ -475,6 +490,10 @@ public:
   }
 
   void Execute() override {
+    const auto started_at = InjectionClock::now();
+    queue_milliseconds_ = std::chrono::duration<double, std::milli>(
+                              started_at - queued_at_)
+                              .count();
     for (const CandidateSource &source : sources_) {
       std::set<std::string> requested_types;
       for (const GrammarManifestEntry &entry : manifest_) {
@@ -488,27 +507,30 @@ public:
               requested_types, handles, candidate_scan_cancelled,
               &cancellation_)) {
         cancelled_ = true;
+        scan_milliseconds_ = elapsed_milliseconds(started_at);
         return;
       }
       for (const std::string &type : requested_types) {
         auto found = handles.find(type);
         if (found == handles.end())
           continue;
-        for (uint32_t handle : found->second)
+        for (uint32_t handle : found->second) {
+          const TSNode node = source.syntax->node(handle);
           items_.push_back(CandidateScanItem{source.syntax, source.grammar_id,
                                               type, handle, source.layer_id,
-                                              source.depth});
+                                              source.depth,
+                                              ts_node_start_byte(node),
+                                              ts_node_end_byte(node)});
+        }
       }
     }
-    std::sort(items_.begin(), items_.end(), [&](const CandidateScanItem &left,
-                                                const CandidateScanItem &right) {
-      const TSNode left_node = left.syntax->node(left.node_handle);
-      const TSNode right_node = right.syntax->node(right.node_handle);
-      return std::make_tuple(left.depth, ts_node_start_byte(left_node),
-                             ts_node_end_byte(left_node), left.type) <
-             std::make_tuple(right.depth, ts_node_start_byte(right_node),
-                             ts_node_end_byte(right_node), right.type);
+    std::sort(items_.begin(), items_.end(), [](const CandidateScanItem &left,
+                                               const CandidateScanItem &right) {
+      return std::tie(left.depth, left.start_byte, left.end_byte, left.type) <
+             std::tie(right.depth, right.start_byte, right.end_byte,
+                      right.type);
     });
+    scan_milliseconds_ = elapsed_milliseconds(started_at);
   }
 
   void OnWorkComplete(Napi::Env env, napi_status status) override {
@@ -523,6 +545,7 @@ public:
 
   void OnOK() override {
     Napi::Env env = Env();
+    const auto pack_started_at = InjectionClock::now();
     std::unique_lock<std::mutex> lock(session_->mutex);
     if (cancelled_ || !current_tags_locked(*session_, tags_) ||
         !engine_->owns_syntax_snapshot(session_->published_syntax, tags_) ||
@@ -597,6 +620,7 @@ public:
     }
 
     impl.candidate_count = request.valid_candidate_ids.size();
+    const uint64_t query_layer_count = request.staged_index->query_layer_count;
     impl.requests.emplace(request_id, std::move(request));
 
     Napi::Object response = Napi::Object::New(env);
@@ -605,6 +629,12 @@ public:
     response.Set("requestId", Napi::Number::New(env, request_id));
     response.Set("injectionPointGeneration",
                  Napi::Number::New(env, injection_point_generation_));
+    response.Set("queryLayerCount",
+                 Napi::Number::New(env, query_layer_count));
+    response.Set("candidateQueueMilliseconds",
+                 Napi::Number::New(env, queue_milliseconds_));
+    response.Set("candidateScanMilliseconds",
+                 Napi::Number::New(env, scan_milliseconds_));
     response.Set("candidateStride", Napi::Number::New(env, 4));
     response.Set("candidates", packed);
     Napi::Array grammar_array = Napi::Array::New(env, grammar_ids.size());
@@ -633,6 +663,9 @@ public:
     for (const std::string &language : unresolved_query_languages)
       unresolved.Set(unresolved_index++, Napi::String::New(env, language));
     response.Set("unresolvedQueryLanguages", unresolved);
+    response.Set("candidatePackMilliseconds",
+                 Napi::Number::New(
+                     env, elapsed_milliseconds(pack_started_at)));
     deferred_.Resolve(response);
     lock.unlock();
     finish_injection_job(env, session_);
@@ -657,6 +690,9 @@ private:
   bool cancelled_ = false;
   CandidateCancellation cancellation_;
   std::shared_ptr<NativeJobControl> job_;
+  InjectionClock::time_point queued_at_;
+  double queue_milliseconds_ = 0;
+  double scan_milliseconds_ = 0;
 };
 
 namespace {
@@ -680,6 +716,17 @@ void finalize_index_counts(InjectionRangeIndex &index) {
       index.failed_child_layer_count++;
     index.maximum_depth = std::max<uint64_t>(index.maximum_depth, layer.depth);
   }
+}
+
+bool publish_topology(uint64_t &published_layer_count,
+                      const InjectionRangeIndex &index) {
+  // A non-empty layer set has just published fresh child syntax, even when its
+  // structural topology is unchanged. The second language-mode notification
+  // is required so consumers cannot retain scopes from the pre-child root
+  // notification. Only stable empty-to-empty publication is suppressible.
+  const bool changed = published_layer_count > 0 || !index.layers.empty();
+  published_layer_count = index.layers.size();
+  return changed;
 }
 
 std::string wasm_language_name(const std::string &path,
@@ -770,7 +817,8 @@ public:
         session_(std::move(session)), engine_(engine), request_id_(request_id),
         tags_(tags), index_(std::move(index)), analysis_(std::move(analysis)),
         job_(std::move(job)), work_items_(std::move(work_items)),
-        maximum_utf16_length_(maximum_utf16_length) {}
+        maximum_utf16_length_(maximum_utf16_length),
+        queued_at_(InjectionClock::now()) {}
 
   Napi::Promise promise() const { return deferred_.Promise(); }
 
@@ -782,9 +830,17 @@ public:
   }
 
   void Execute() override {
+    const auto started_at = InjectionClock::now();
+    queue_milliseconds_ = std::chrono::duration<double, std::milli>(
+                              started_at - queued_at_)
+                              .count();
+    const auto finish_timing = [&]() {
+      parse_milliseconds_ = elapsed_milliseconds(started_at);
+    };
     SnapshotReader reader(job_->lease());
     if (!reader.valid()) {
       SetError("Unable to read snapshot while parsing injected languages");
+      finish_timing();
       return;
     }
     SyntaxCancellation cancellation{
@@ -794,6 +850,7 @@ public:
     for (const WorkItem &item : work_items_) {
       if (cancellation.requested()) {
         cancelled_ = true;
+        finish_timing();
         return;
       }
       InjectionLayerRecord &layer = index_->layers[item.layer_index];
@@ -824,6 +881,7 @@ public:
       }
       if (result.cancelled || cancellation.requested()) {
         cancelled_ = true;
+        finish_timing();
         return;
       }
       layer.syntax_parsed = result.parsed;
@@ -832,6 +890,7 @@ public:
       layer.queries = std::move(result.query_snapshot);
     }
     finalize_index_counts(*index_);
+    finish_timing();
   }
 
   void OnWorkComplete(Napi::Env env, napi_status status) override {
@@ -862,6 +921,8 @@ public:
       finish_injection_job(env, session_);
       return;
     }
+    const bool topology_changed = publish_topology(
+        engine_->impl_->published_layer_count, *index_);
     engine_->impl_->published_index = index_;
     engine_->impl_->published_generation++;
     engine_->impl_->candidate_count = 0;
@@ -874,6 +935,12 @@ public:
                  Napi::Number::New(env, index_->parsed_child_layer_count));
     response.Set("failedChildLayers",
                  Napi::Number::New(env, index_->failed_child_layer_count));
+    response.Set("topologyChanged",
+                 Napi::Boolean::New(env, topology_changed));
+    response.Set("childParseQueueMilliseconds",
+                 Napi::Number::New(env, queue_milliseconds_));
+    response.Set("childParseMilliseconds",
+                 Napi::Number::New(env, parse_milliseconds_));
     deferred_.Resolve(response);
     lock.unlock();
     finish_injection_job(env, session_);
@@ -908,6 +975,9 @@ private:
   std::vector<WorkItem> work_items_;
   uint64_t maximum_utf16_length_ = MAX_SYNTAX_UTF16_LENGTH;
   bool cancelled_ = false;
+  InjectionClock::time_point queued_at_;
+  double queue_milliseconds_ = 0;
+  double parse_milliseconds_ = 0;
 };
 
 InjectionEngine::InjectionEngine() : impl_(std::make_unique<Impl>()) {}
@@ -982,6 +1052,7 @@ void InjectionEngine::clear() {
   impl_->query_grammars.clear();
   impl_->query_rejected_aliases.clear();
   impl_->candidate_count = 0;
+  impl_->published_layer_count = 0;
   impl_->published_generation++;
 }
 
@@ -1102,6 +1173,8 @@ Napi::Value InjectionEngine::queue_child_parse(
   }
   if (work_items.empty()) {
     finalize_index_counts(*request.staged_index);
+    const bool topology_changed =
+        publish_topology(impl_->published_layer_count, *request.staged_index);
     impl_->published_index = request.staged_index;
     impl_->published_generation++;
     impl_->candidate_count = 0;
@@ -1113,6 +1186,10 @@ Napi::Value InjectionEngine::queue_child_parse(
     response.Set("requestId", Napi::Number::New(env, request_id));
     response.Set("parsedChildLayers", Napi::Number::New(env, 0));
     response.Set("failedChildLayers", Napi::Number::New(env, 0));
+    response.Set("topologyChanged",
+                 Napi::Boolean::New(env, topology_changed));
+    response.Set("childParseQueueMilliseconds", Napi::Number::New(env, 0));
+    response.Set("childParseMilliseconds", Napi::Number::New(env, 0));
     return response;
   }
 
@@ -2110,8 +2187,23 @@ bool PublishedSyntaxSnapshot::collect_handles_for_types(
   if (missing.empty())
     return true;
 
+  const TSLanguage *language = ts_tree_language(impl_->tree);
+  std::unordered_map<TSSymbol, std::vector<const std::string *>>
+      missing_by_symbol;
+  missing_by_symbol.reserve(missing.size() * 2);
+  for (const std::string &type : missing) {
+    for (bool named : {false, true}) {
+      const TSSymbol symbol = ts_language_symbol_for_name(
+          language, type.data(), static_cast<uint32_t>(type.size()), named);
+      if (symbol != 0)
+        missing_by_symbol[symbol].push_back(&type);
+    }
+  }
+
   std::map<std::string, std::vector<TSNode>> found_nodes;
-  std::vector<TSNode> pending{ts_tree_root_node(impl_->tree)};
+  std::vector<TSNode> pending;
+  pending.reserve(64);
+  pending.push_back(ts_tree_root_node(impl_->tree));
   uint64_t visited = 0;
   while (!pending.empty()) {
     if ((visited++ & UINT64_C(4095)) == 0 && cancellation != nullptr &&
@@ -2119,19 +2211,34 @@ bool PublishedSyntaxSnapshot::collect_handles_for_types(
       return false;
     const TSNode node_value = pending.back();
     pending.pop_back();
-    const std::string_view type = ts_node_type(node_value);
-    if (missing.contains(std::string(type)))
-      found_nodes[std::string(type)].push_back(node_value);
+    const auto requested = missing_by_symbol.find(ts_node_symbol(node_value));
+    if (requested != missing_by_symbol.end()) {
+      const std::string_view actual_type = ts_node_type(node_value);
+      for (const std::string *type : requested->second) {
+        if (actual_type == *type)
+          found_nodes[*type].push_back(node_value);
+      }
+    }
     const uint32_t count = ts_node_child_count(node_value);
     for (uint32_t index = count; index > 0; index--)
       pending.push_back(ts_node_child(node_value, index - 1));
   }
 
   std::lock_guard<std::mutex> lock(impl_->mutex);
+  size_t new_handle_count = 0;
+  for (const auto &[_, nodes] : found_nodes)
+    new_handle_count += nodes.size();
+  impl_->nodes.reserve(impl_->nodes.size() + new_handle_count);
+  impl_->handles.reserve(impl_->handles.size() + new_handle_count);
   for (const std::string &type : missing) {
+    if (impl_->indexed_types.contains(type)) {
+      result[type] = impl_->handles_by_type[type];
+      continue;
+    }
     std::vector<uint32_t> &cached = impl_->handles_by_type[type];
     for (TSNode node_value : found_nodes[type]) {
-      auto existing = impl_->handles.find(node_key(node_value));
+      const NodeKey key = node_key(node_value);
+      auto existing = impl_->handles.find(key);
       uint32_t handle = 0;
       if (existing != impl_->handles.end()) {
         handle = existing->second;
@@ -2140,7 +2247,7 @@ bool PublishedSyntaxSnapshot::collect_handles_for_types(
           return false;
         handle = static_cast<uint32_t>(impl_->nodes.size() + 1);
         impl_->nodes.push_back(node_value);
-        impl_->handles.emplace(node_key(node_value), handle);
+        impl_->handles.emplace(key, handle);
       }
       cached.push_back(handle);
     }
@@ -2559,16 +2666,39 @@ InjectionNodeWrapper::descendants_of_type(const Napi::CallbackInfo &info) {
         "ERR_INVALID_INJECTION_NODE_TYPE");
   }
 
+  const TSLanguage *language = ts_tree_language(tree_->tree());
+  std::unordered_map<TSSymbol, std::vector<const std::string *>>
+      accepted_by_symbol;
+  accepted_by_symbol.reserve(accepted.size() * 2);
+  for (const std::string &type : accepted) {
+    for (bool named : {false, true}) {
+      const TSSymbol symbol = ts_language_symbol_for_name(
+          language, type.data(), static_cast<uint32_t>(type.size()), named);
+      if (symbol != 0)
+        accepted_by_symbol[symbol].push_back(&type);
+    }
+  }
+
+  std::vector<TSNode> matches;
   std::vector<TSNode> pending;
+  pending.reserve(64);
   const uint32_t root_child_count = ts_node_child_count(node);
   for (uint32_t index = root_child_count; index > 0; index--)
     pending.push_back(ts_node_child(node, index - 1));
-  std::vector<TSNode> matches;
   while (!pending.empty()) {
     const TSNode candidate = pending.back();
     pending.pop_back();
-    if (accepted.contains(ts_node_type(candidate)))
-      matches.push_back(candidate);
+    const auto accepted_types =
+        accepted_by_symbol.find(ts_node_symbol(candidate));
+    if (accepted_types != accepted_by_symbol.end()) {
+      const std::string_view actual_type = ts_node_type(candidate);
+      for (const std::string *accepted_type : accepted_types->second) {
+        if (actual_type == *accepted_type) {
+          matches.push_back(candidate);
+          break;
+        }
+      }
+    }
     const uint32_t count = ts_node_child_count(candidate);
     for (uint32_t index = count; index > 0; index--)
       pending.push_back(ts_node_child(candidate, index - 1));

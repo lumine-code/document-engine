@@ -109,13 +109,19 @@ function compareLines(pair) {
 
 function compareMappings(pair) {
   const clips = ['backward', 'closest', 'forward']
+  const packedBufferPoints = []
+  const packedExpectedByClip = new Map(clips.map((clip) => [clip, []]))
   for (let row = 0; row < pair.buffer.getLineCount(); row++) {
     const lineLength = pair.buffer.lineForRow(row).length
     for (let column = 0; column <= lineLength + 2; column++) {
+      packedBufferPoints.push(row, column)
       for (const clipDirection of clips) {
         const expected = point(
           pair.legacy.translateBufferPosition({row, column}, {clipDirection}),
         )
+        packedExpectedByClip
+          .get(clipDirection)
+          .push(expected.row, expected.column)
         const actual = pair.native.bufferToScreen({row, column}, clipDirection)
         assert.deepEqual(
           actual,
@@ -124,6 +130,14 @@ function compareMappings(pair) {
         )
       }
     }
+  }
+  const packedInput = Uint32Array.from(packedBufferPoints)
+  for (const clipDirection of clips) {
+    assert.deepEqual(
+      Array.from(pair.native.bufferToScreen(packedInput, clipDirection)),
+      packedExpectedByClip.get(clipDirection),
+      `packed buffer points ${clipDirection}`,
+    )
   }
 
   const screenLineCount = pair.legacy.getScreenLineCount()
@@ -258,6 +272,65 @@ test(
     try {
       compareLines(pair)
       compareMappings(pair)
+    } finally {
+      await pair.destroy()
+    }
+  },
+)
+
+test(
+  'matches packed and scalar mappings at soft-wrap and fold boundaries',
+  {
+    skip: !hasLegacyOracle,
+  },
+  async () => {
+    const pair = await buildPair({
+      text: 'abcdefghijklmnop\nqrstuvwxyz\ntail',
+      options: {
+        ...parityOptions,
+        wrapColumn: 4,
+        softWrapHangingIndent: 0,
+        wrapBoundaryMode: 'none',
+      },
+      folds: [
+        [
+          [0, 4],
+          [1, 2],
+        ],
+      ],
+    })
+    const points = [
+      [0, 0],
+      [0, 3],
+      [0, 4],
+      [0, 5],
+      [1, 0],
+      [1, 2],
+      [1, 4],
+      [2, 0],
+      [2, 4],
+    ]
+    const packed = Uint32Array.from(points.flat())
+    try {
+      for (const clipDirection of ['backward', 'closest', 'forward']) {
+        const expected = points.flatMap(([row, column]) => {
+          const mapped = pair.legacy.translateBufferPosition(
+            {row, column},
+            {clipDirection},
+          )
+          assert.deepEqual(
+            pair.native.bufferToScreen({row, column}, clipDirection),
+            point(mapped),
+            `scalar buffer [${row}, ${column}] ${clipDirection}`,
+          )
+          return [mapped.row, mapped.column]
+        })
+        assert.deepEqual(
+          Array.from(pair.native.bufferToScreen(packed, clipDirection)),
+          expected,
+          `packed soft-wrap/fold boundaries ${clipDirection}`,
+        )
+      }
     } finally {
       await pair.destroy()
     }

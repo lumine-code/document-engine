@@ -169,6 +169,10 @@ export interface InjectionCandidateBatch extends InjectionRevisionTags {
   candidates: Uint32Array
   grammarIds: string[]
   kinds: string[]
+  queryLayerCount: number
+  candidateQueueMilliseconds: number
+  candidateScanMilliseconds: number
+  candidatePackMilliseconds: number
   unresolvedQueryLanguages?: string[]
 }
 
@@ -299,6 +303,12 @@ export interface DisplayViewDiagnostics {
   foldResetMilliseconds: number
   indexRebuildCount: number
   indexRebuildMilliseconds: number
+  indexIncrementalUpdateCount: number
+  indexIncrementalFallbackCount: number
+  indexIncrementalUpdateMilliseconds: number
+  indexIncrementalRowsRebuilt: number
+  indexIncrementalRowsReused: number
+  indexIncrementalLayoutUnitsScanned: number
   renderPlanCount: number
   renderPlanMilliseconds: number
   screenRowCount: number

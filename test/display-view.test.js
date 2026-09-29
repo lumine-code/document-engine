@@ -1,8 +1,11 @@
 'use strict'
 
+process.env.LUMINE_DOCUMENT_ENGINE_ENABLE_TEST_FAULTS = '1'
+
 const assert = require('node:assert/strict')
 const test = require('node:test')
-const {DocumentSession} = require('..')
+const {DocumentSession, _createFailingSnapshotLeaseForTest} = require('..')
+delete process.env.LUMINE_DOCUMENT_ENGINE_ENABLE_TEST_FAULTS
 const {loadSuperstring} = require('./helpers')
 
 const {TextBuffer} = loadSuperstring()
@@ -40,6 +43,49 @@ function unpackRenderPlan(plan) {
           : plan.lineDescriptors[offset + 4],
     }
   })
+}
+
+function normalizedLines(view) {
+  return view
+    .buildRenderPlan(0, view.getScreenLineCount() + 1)
+    .lines.map(({lineText, tags, softWrapIndent}) => ({
+      lineText,
+      tags: Array.from(tags),
+      softWrapIndent,
+    }))
+}
+
+function compareDisplayViews(incremental, rebuilt, buffer) {
+  assert.deepEqual(normalizedLines(incremental), normalizedLines(rebuilt))
+  for (let row = 0; row < buffer.getLineCount(); row++) {
+    const length = buffer.lineLengthForRow(row)
+    for (let column = 0; column <= length; column++) {
+      for (const clip of ['backward', 'closest', 'forward']) {
+        assert.deepEqual(
+          incremental.bufferToScreen({row, column}, clip),
+          rebuilt.bufferToScreen({row, column}, clip),
+          `buffer point [${row}, ${column}] ${clip}`,
+        )
+      }
+    }
+  }
+  const screenRows = incremental.getScreenLineCount()
+  assert.equal(screenRows, rebuilt.getScreenLineCount())
+  for (let row = 0; row < screenRows; row++) {
+    const length = Math.max(
+      incremental.lineLengthForScreenRow(row),
+      rebuilt.lineLengthForScreenRow(row),
+    )
+    for (let column = 0; column <= length + 1; column++) {
+      for (const clip of ['backward', 'closest', 'forward']) {
+        assert.deepEqual(
+          incremental.screenToBuffer({row, column}, clip),
+          rebuilt.screenToBuffer({row, column}, clip),
+          `screen point [${row}, ${column}] ${clip}`,
+        )
+      }
+    }
+  }
 }
 
 test('builds viewport-only render lines and preserves the compatibility shape', async () => {
@@ -90,6 +136,380 @@ test('builds viewport-only render lines and preserves the compatibility shape', 
   assert.equal(diagnostics.fullBufferMaterializations, 0)
   assert.ok(diagnostics.viewportUtf16Copied > 0)
   await session.destroy()
+})
+
+test('renders fragmented snapshot storage like the same contiguous text', async () => {
+  const fragmented = new TextBuffer(
+    `${'alpha beta\tgamma/delta '.repeat(8)}\n${'tail '.repeat(20)}`,
+  )
+  fragmented.setTextInRange(
+    {start: {row: 0, column: 17}, end: {row: 0, column: 17}},
+    '界',
+  )
+  fragmented.setTextInRange(
+    {start: {row: 1, column: 11}, end: {row: 1, column: 11}},
+    'e\u0301',
+  )
+  fragmented.setTextInRange(
+    {start: {row: 0, column: 73}, end: {row: 0, column: 76}},
+    'XYZ',
+  )
+  const contiguous = new TextBuffer(fragmented.getText())
+  const fragmentedSession = new DocumentSession()
+  const contiguousSession = new DocumentSession()
+  const options = {
+    wrapColumn: 17,
+    tabLength: 4,
+    wrapBoundaryMode: 'standard',
+    characterWidthProfile: {doubleWidth: 2},
+  }
+  const fragmentedView = fragmentedSession.createDisplayView(options)
+  const contiguousView = contiguousSession.createDisplayView(options)
+
+  await publish(fragmentedSession, fragmented, 1)
+  await publish(contiguousSession, contiguous, 1)
+  const folds = new Uint32Array([7, 0, 31, 0, 67])
+  fragmentedView.replaceFolds(1, 1, folds)
+  contiguousView.replaceFolds(1, 1, folds)
+
+  const normalizePlan = (plan) =>
+    plan.lines.map(({lineText, tags, softWrapIndent}) => ({
+      lineText,
+      tags: Array.from(tags),
+      softWrapIndent,
+    }))
+  assert.deepEqual(
+    normalizePlan(fragmentedView.buildRenderPlan(0, 100)),
+    normalizePlan(contiguousView.buildRenderPlan(0, 100)),
+  )
+  for (const point of [
+    {row: 0, column: 0},
+    {row: 0, column: 17},
+    {row: 0, column: 68},
+    {row: 0, column: 150},
+    {row: 1, column: 12},
+  ]) {
+    assert.deepEqual(
+      fragmentedView.bufferToScreen(point),
+      contiguousView.bufferToScreen(point),
+    )
+  }
+
+  await fragmentedSession.destroy()
+  await contiguousSession.destroy()
+})
+
+test('matches contiguous storage across randomized fragment layouts and seeks', async () => {
+  let randomState = 0x6d2b79f5
+  const random = (maximum) => {
+    randomState = (Math.imul(randomState, 1664525) + 1013904223) >>> 0
+    return randomState % maximum
+  }
+  const insertions = ['x', '\t', '界', 'e\u0301']
+
+  for (let iteration = 0; iteration < 12; iteration++) {
+    const fragmented = new TextBuffer(
+      `${'alpha beta/gamma '.repeat(6)}\n${'middle delta '.repeat(6)}\n${'tail '.repeat(12)}`,
+    )
+    for (let edit = 0; edit < 24; edit++) {
+      const row = random(3)
+      const column = random(fragmented.lineLengthForRow(row) + 1)
+      fragmented.setTextInRange(
+        {start: {row, column}, end: {row, column}},
+        insertions[random(insertions.length)],
+      )
+    }
+
+    const contiguous = new TextBuffer(fragmented.getText())
+    const fragmentedSession = new DocumentSession()
+    const contiguousSession = new DocumentSession()
+    const options = {
+      wrapColumn: 9 + random(10),
+      tabLength: 2 + random(4),
+      wrapBoundaryMode: 'standard',
+      characterWidthProfile: {doubleWidth: 2},
+    }
+    const fragmentedView = fragmentedSession.createDisplayView(options)
+    const contiguousView = contiguousSession.createDisplayView(options)
+
+    try {
+      await publish(fragmentedSession, fragmented, 1)
+      await publish(contiguousSession, contiguous, 1)
+      const folds = new Uint32Array([7, 0, 19, 0, 43, 9, 1, 7, 2, 11])
+      fragmentedView.replaceFolds(1, 1, folds)
+      contiguousView.replaceFolds(1, 1, folds)
+
+      const normalizePlan = (plan) =>
+        plan.lines.map(({lineText, tags, softWrapIndent}) => ({
+          lineText,
+          tags: Array.from(tags),
+          softWrapIndent,
+        }))
+      assert.deepEqual(
+        normalizePlan(fragmentedView.buildRenderPlan(0, 1000)),
+        normalizePlan(contiguousView.buildRenderPlan(0, 1000)),
+        `render plan iteration ${iteration}`,
+      )
+
+      const points = new Uint32Array(128)
+      for (let index = 0; index < points.length; index += 2) {
+        const row = random(3)
+        points[index] = row
+        points[index + 1] = random(fragmented.lineLengthForRow(row) + 1)
+      }
+      assert.deepEqual(
+        Array.from(fragmentedView.bufferToScreen(points)),
+        Array.from(contiguousView.bufferToScreen(points)),
+        `random seeks iteration ${iteration}`,
+      )
+    } finally {
+      await fragmentedSession.destroy()
+      await contiguousSession.destroy()
+    }
+  }
+})
+
+test('incrementally reflows one edited source line like a forced full rebuild', async () => {
+  let randomState = 0x13579bdf
+  const random = (maximum) => {
+    randomState = (Math.imul(randomState, 1664525) + 1013904223) >>> 0
+    return randomState % maximum
+  }
+  const initial =
+    '  alpha\tbeta😀gamma e\u0301 delta / tail words\n' +
+    'second\tline with 界 and many words to wrap\n' +
+    'third-line/with-boundaries and a trailing token'
+  const incrementalBuffer = new TextBuffer(initial)
+  const rebuiltBuffer = new TextBuffer(initial)
+  const incrementalSession = new DocumentSession()
+  const rebuiltSession = new DocumentSession()
+  const options = {
+    wrapColumn: 13,
+    tabLength: 4,
+    softWrapHangingIndent: 2,
+    wrapBoundaryMode: 'standard',
+    characterWidthProfile: {doubleWidth: 2},
+  }
+  const incrementalView = incrementalSession.createDisplayView(options)
+  const rebuiltView = rebuiltSession.createDisplayView(options)
+  const replacements = ['', 'x', '\t', '界', 'e\u0301', '😀']
+
+  try {
+    await publish(incrementalSession, incrementalBuffer, 1)
+    await publish(rebuiltSession, rebuiltBuffer, 1)
+    compareDisplayViews(incrementalView, rebuiltView, incrementalBuffer)
+
+    for (let revision = 2; revision <= 31; revision++) {
+      const row = random(incrementalBuffer.getLineCount())
+      const lineLength = incrementalBuffer.lineLengthForRow(row)
+      const startColumn = random(lineLength + 1)
+      const deletedLength = Math.min(random(4), lineLength - startColumn)
+      const endColumn = startColumn + deletedLength
+      const replacement = replacements[random(replacements.length)]
+      const range = {
+        start: {row, column: startColumn},
+        end: {row, column: endColumn},
+      }
+      incrementalBuffer.setTextInRange(range, replacement)
+      rebuiltBuffer.setTextInRange(range, replacement)
+
+      let snapshot = incrementalBuffer.getSnapshot()
+      await incrementalSession.applyRevision(
+        snapshot,
+        new Uint32Array([
+          row,
+          startColumn,
+          row,
+          endColumn,
+          row,
+          startColumn,
+          row,
+          startColumn + replacement.length,
+        ]),
+        revision,
+      )
+      snapshot.destroy()
+      snapshot = rebuiltBuffer.getSnapshot()
+      // Omitting edit metadata deliberately keeps this view on the full-rebuild
+      // oracle while publishing the same immutable snapshot.
+      await rebuiltSession.applyRevision(snapshot, new Uint32Array(0), revision)
+      snapshot.destroy()
+
+      compareDisplayViews(incrementalView, rebuiltView, incrementalBuffer)
+    }
+
+    const incrementalDiagnostics = incrementalView.getDiagnostics()
+    const rebuiltDiagnostics = rebuiltView.getDiagnostics()
+    assert.equal(incrementalDiagnostics.indexIncrementalUpdateCount, 30)
+    assert.equal(incrementalDiagnostics.indexIncrementalFallbackCount, 0)
+    assert.equal(rebuiltDiagnostics.indexIncrementalUpdateCount, 0)
+    assert.ok(incrementalDiagnostics.indexIncrementalRowsReused > 0)
+  } finally {
+    await incrementalSession.destroy()
+    await rebuiltSession.destroy()
+  }
+})
+
+test('bounds incremental reflow work by the edited soft-wrap suffix', async () => {
+  const length = 20_000
+  const buffer = new TextBuffer('x'.repeat(length))
+  const session = new DocumentSession()
+  const view = session.createDisplayView({wrapColumn: 100})
+
+  try {
+    await publish(session, buffer, 1)
+    view.buildRenderPlan(0, 1)
+    const initial = view.getDiagnostics()
+    assert.equal(initial.indexRebuildCount, 1)
+
+    const edit = async (revision, column, inserted) => {
+      const oldLength = inserted ? 0 : 1
+      const newLength = inserted ? 1 : 0
+      buffer.setTextInRange(
+        {
+          start: {row: 0, column},
+          end: {row: 0, column: column + oldLength},
+        },
+        inserted ? 'y' : '',
+      )
+      const snapshot = buffer.getSnapshot()
+      await session.applyRevision(
+        snapshot,
+        new Uint32Array([
+          0,
+          column,
+          0,
+          column + oldLength,
+          0,
+          column,
+          0,
+          column + newLength,
+        ]),
+        revision,
+      )
+      snapshot.destroy()
+      view.buildRenderPlan(0, 1)
+    }
+
+    await edit(2, Math.floor(length / 2), true)
+    let diagnostics = view.getDiagnostics()
+    assert.equal(diagnostics.indexIncrementalUpdateCount, 1)
+    assert.equal(diagnostics.indexRebuildCount, 1)
+    assert.ok(diagnostics.layoutUnitsScanned < length * 0.55)
+    assert.ok(diagnostics.indexIncrementalRowsReused > 90)
+
+    const previousUnits = diagnostics.indexIncrementalLayoutUnitsScanned
+    await edit(3, buffer.lineLengthForRow(0) - 10, true)
+    diagnostics = view.getDiagnostics()
+    assert.equal(diagnostics.indexIncrementalUpdateCount, 2)
+    assert.ok(
+      diagnostics.indexIncrementalLayoutUnitsScanned - previousUnits < 250,
+    )
+  } finally {
+    await session.destroy()
+  }
+})
+
+test('falls back to a full display rebuild when an edit changes line count', async () => {
+  const buffer = new TextBuffer('abc def ghi')
+  const session = new DocumentSession()
+  const view = session.createDisplayView({wrapColumn: 5})
+  try {
+    await publish(session, buffer, 1)
+    view.buildRenderPlan(0, 10)
+    buffer.setTextInRange(
+      {start: {row: 0, column: 3}, end: {row: 0, column: 3}},
+      '\n',
+    )
+    const snapshot = buffer.getSnapshot()
+    await session.applyRevision(
+      snapshot,
+      new Uint32Array([0, 3, 0, 3, 0, 3, 1, 0]),
+      2,
+    )
+    snapshot.destroy()
+    assert.deepEqual(
+      view.buildRenderPlan(0, 10).lines.map((line) => line.lineText),
+      ['abc', ' def ', ' ghi'],
+    )
+    const diagnostics = view.getDiagnostics()
+    assert.equal(diagnostics.indexIncrementalUpdateCount, 0)
+    assert.equal(diagnostics.indexIncrementalFallbackCount, 1)
+    assert.equal(diagnostics.indexRebuildCount, 2)
+  } finally {
+    await session.destroy()
+  }
+})
+
+test('does not publish display geometry after a SnapshotLease chunk failure', async () => {
+  for (const scenario of [
+    {
+      name: 'incremental update',
+      replacement: 'X',
+      edits: new Uint32Array([0, 5, 0, 5, 0, 5, 0, 6]),
+      expectedLines: ['alphaX beta', 'tail'],
+    },
+    {
+      name: 'full rebuild',
+      replacement: '\n',
+      edits: new Uint32Array([0, 5, 0, 5, 0, 5, 1, 0]),
+      expectedLines: ['alpha', ' beta', 'tail'],
+    },
+  ]) {
+    const buffer = new TextBuffer('alpha beta\ntail')
+    const session = new DocumentSession()
+    const view = session.createDisplayView({wrapColumn: 80})
+    try {
+      await publish(session, buffer, 1)
+      assert.deepEqual(
+        view.buildRenderPlan(0, 10).lines.map((line) => line.lineText),
+        ['alpha beta', 'tail'],
+      )
+      const before = view.getDiagnostics()
+
+      buffer.setTextInRange(
+        {start: {row: 0, column: 5}, end: {row: 0, column: 5}},
+        scenario.replacement,
+      )
+      const upstream = buffer.getSnapshot()
+      const failing = _createFailingSnapshotLeaseForTest(upstream, 0)
+      upstream.destroy()
+      await session.applyRevision(failing, scenario.edits, 2)
+      failing.destroy()
+
+      assert.throws(
+        () => view.buildRenderPlan(0, 10),
+        (error) =>
+          error.code === 'ERR_SNAPSHOT_LEASE' &&
+          /chunk read/i.test(error.message),
+        scenario.name,
+      )
+      const failed = view.getDiagnostics()
+      assert.equal(failed.cachedBufferRevision, 0)
+      assert.equal(failed.targetBufferRevision, 2)
+      assert.equal(failed.displayRevision, before.displayRevision)
+      assert.equal(failed.indexRebuildCount, before.indexRebuildCount)
+      assert.equal(
+        failed.indexIncrementalUpdateCount,
+        before.indexIncrementalUpdateCount,
+      )
+      assert.equal(failed.sourceUtf16Length, before.sourceUtf16Length)
+      assert.equal(failed.screenRowCount, before.screenRowCount)
+
+      const recovery = buffer.getSnapshot()
+      await session.applyRevision(recovery, new Uint32Array(0), 3)
+      recovery.destroy()
+      const recovered = view.buildRenderPlan(0, 10)
+      assert.equal(recovered.bufferRevision, 3)
+      assert.deepEqual(
+        recovered.lines.map((line) => line.lineText),
+        scenario.expectedLines,
+      )
+      assert.equal(view.getDiagnostics().cachedBufferRevision, 3)
+    } finally {
+      await session.destroy()
+    }
+  }
 })
 
 test('preserves dynamic continuation indentation after leading whitespace wraps', async () => {

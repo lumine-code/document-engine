@@ -34,19 +34,28 @@ struct DisplayViewState {
   uint64_t highlight_syntax_revision = 0;
   std::unordered_map<uint32_t, Fold> folds;
   std::unique_ptr<DisplayIndex> index;
+  bool index_initialized = false;
   std::vector<LineIdentity> line_identities;
   std::vector<LineIdentity> pending_line_identities;
+  std::vector<RevisionEditBatch> pending_display_edits;
+  bool pending_display_edits_eligible = true;
   RenderStyle render_style;
   std::vector<ScopedRange> highlight_ranges;
   uint64_t accepted_edit_count = 0;
   uint64_t fold_delta_count = 0;
   uint64_t fold_reset_count = 0;
   uint64_t index_rebuild_count = 0;
+  uint64_t index_incremental_update_count = 0;
+  uint64_t index_incremental_fallback_count = 0;
+  uint64_t index_incremental_rows_rebuilt = 0;
+  uint64_t index_incremental_rows_reused = 0;
+  uint64_t index_incremental_layout_units_scanned = 0;
   uint64_t render_plan_count = 0;
   double fold_delta_milliseconds = 0;
   double fold_delta_maximum_milliseconds = 0;
   double fold_reset_milliseconds = 0;
   double index_rebuild_milliseconds = 0;
+  double index_incremental_update_milliseconds = 0;
   double render_plan_milliseconds = 0;
 };
 

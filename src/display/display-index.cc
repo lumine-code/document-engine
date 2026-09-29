@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <limits>
+#include <utility>
 
 namespace document_engine {
 
@@ -354,18 +356,32 @@ void DisplayIndex::append_screen_row(const SnapshotReader &reader,
   row.buffer_start = line.start;
   row.buffer_end = line.end;
 
-  // The overwhelmingly common wrapped-line case is one contiguous source
-  // segment. The wrapping pass already knows its visual width, so retain one
-  // compact span without reading every code unit for a second time.
-  if (known_visual_width != UINT64_MAX && line.segments.size() == 1 &&
-      line.segments.front().kind == DisplaySpan::Kind::Source) {
-    const LogicalSegment &segment = line.segments.front();
-    const uint64_t start_offset = start.segment == 0
-                                      ? start.position
-                                      : segment.end_offset;
-    const uint64_t end_offset = end.segment == 0
-                                    ? end.position
-                                    : segment.end_offset;
+  // The wrapping pass already scanned every display unit and knows this row's
+  // visual width. Most rows of a folded logical line are still slices of one
+  // contiguous source segment, so retain one compact span for those too rather
+  // than reading the same source units again merely because another row of the
+  // logical line contains a fold placeholder.
+  const LogicalSegment *compact_source = nullptr;
+  uint64_t compact_start_offset = 0;
+  uint64_t compact_end_offset = 0;
+  if (known_visual_width != UINT64_MAX &&
+      start.segment < line.segments.size()) {
+    const LogicalSegment &candidate = line.segments[start.segment];
+    if (candidate.kind == DisplaySpan::Kind::Source) {
+      compact_start_offset = start.position;
+      if (end.segment == start.segment) {
+        compact_end_offset = end.position;
+        compact_source = &candidate;
+      } else if (end.segment == start.segment + 1) {
+        compact_end_offset = candidate.end_offset;
+        compact_source = &candidate;
+      }
+    }
+  }
+  if (compact_source != nullptr) {
+    const LogicalSegment &segment = *compact_source;
+    const uint64_t start_offset = compact_start_offset;
+    const uint64_t end_offset = compact_end_offset;
     if (start_offset < end_offset) {
       row.buffer_start =
           Point{segment.start.row,
@@ -435,16 +451,23 @@ void DisplayIndex::append_screen_row(const SnapshotReader &reader,
 
 void DisplayIndex::wrap_logical_line(const SnapshotReader &reader,
                                      const LogicalLine &line) {
-  const UnitCursor logical_start = begin_cursor(line);
+  wrap_logical_line_from(reader, line, begin_cursor(line), 0, true, false, 0);
+}
+
+void DisplayIndex::wrap_logical_line_from(
+    const SnapshotReader &reader, const LogicalLine &line,
+    UnitCursor logical_start, uint32_t leading_indent,
+    bool starts_in_leading_whitespace,
+    bool continuation_indent_is_fixed, uint32_t fixed_continuation_indent) {
   const UnitCursor logical_end = end_cursor(line);
   if (same_cursor(logical_start, logical_end)) {
-    append_screen_row(reader, line, logical_start, logical_end, 0, true,
-                      false, 0, 0);
+    append_screen_row(reader, line, logical_start, logical_end, leading_indent,
+                      starts_in_leading_whitespace, false, 0, leading_indent);
     return;
   }
   if (options_.wrap_column == 0) {
-    append_screen_row(reader, line, logical_start, logical_end, 0, true,
-                      false, 0, UINT64_MAX);
+    append_screen_row(reader, line, logical_start, logical_end, leading_indent,
+                      starts_in_leading_whitespace, false, 0, UINT64_MAX);
     return;
   }
 
@@ -453,13 +476,13 @@ void DisplayIndex::wrap_logical_line(const SnapshotReader &reader,
   UnitCursor last_boundary{};
   uint64_t last_boundary_screen_column = 0;
   bool has_boundary = false;
-  bool saw_non_whitespace = false;
+  bool saw_non_whitespace = !starts_in_leading_whitespace;
   int64_t first_non_whitespace_screen_column = -1;
-  bool builder_in_leading_whitespace = true;
-  bool row_starts_in_leading_whitespace = true;
-  uint32_t leading_indent = 0;
-  uint64_t screen_column = 0;
-  double line_width = 0;
+  bool builder_in_leading_whitespace = starts_in_leading_whitespace;
+  bool row_starts_in_leading_whitespace = starts_in_leading_whitespace;
+  uint64_t screen_column = leading_indent;
+  double line_width =
+      leading_indent * ratio_for_character(static_cast<char16_t>(u' '));
 
   while (!same_cursor(cursor, logical_end)) {
     const UnitCursor before = cursor;
@@ -491,7 +514,9 @@ void DisplayIndex::wrap_logical_line(const SnapshotReader &reader,
 
     if (should_wrap) {
       const uint32_t next_indent =
-          continuation_indent(first_non_whitespace_screen_column);
+          continuation_indent_is_fixed
+              ? fixed_continuation_indent
+              : continuation_indent(first_non_whitespace_screen_column);
       const UnitCursor split = has_boundary ? last_boundary : before;
       if (!same_cursor(split, row_start)) {
         const uint64_t split_screen_column =
@@ -532,7 +557,19 @@ void DisplayIndex::wrap_logical_line(const SnapshotReader &reader,
                     screen_column);
 }
 
-void DisplayIndex::rebuild(
+bool DisplayIndex::rebuild(
+    const SnapshotReader &reader,
+    std::shared_ptr<const SnapshotAnalysis> analysis,
+    const std::unordered_map<uint32_t, Fold> &folds) {
+  DisplayIndex replacement(options_);
+  replacement.rebuild_in_place(reader, std::move(analysis), folds);
+  if (!reader.valid())
+    return false;
+  adopt_state(std::move(replacement));
+  return true;
+}
+
+void DisplayIndex::rebuild_in_place(
     const SnapshotReader &reader,
     std::shared_ptr<const SnapshotAnalysis> analysis,
     const std::unordered_map<uint32_t, Fold> &folds) {
@@ -578,6 +615,198 @@ void DisplayIndex::rebuild(
         std::max<uint64_t>(peak_logical_segments_, line.segments.size());
     wrap_logical_line(reader, line);
   }
+}
+
+void DisplayIndex::adopt_state(DisplayIndex &&replacement) {
+  analysis_ = std::move(replacement.analysis_);
+  folds_ = std::move(replacement.folds_);
+  rows_ = std::move(replacement.rows_);
+  leading_whitespace_ends_ =
+      std::move(replacement.leading_whitespace_ends_);
+  trailing_whitespace_starts_ =
+      std::move(replacement.trailing_whitespace_starts_);
+  layout_units_scanned_ = replacement.layout_units_scanned_;
+  peak_logical_segments_ = replacement.peak_logical_segments_;
+  peak_row_spans_ = replacement.peak_row_spans_;
+}
+
+bool DisplayIndex::update(
+    const SnapshotReader &reader,
+    std::shared_ptr<const SnapshotAnalysis> analysis,
+    const std::unordered_map<uint32_t, Fold> &folds,
+    const std::vector<RevisionEditBatch> &edits,
+    DisplayIndexUpdateDiagnostics *diagnostics) {
+  if (diagnostics != nullptr)
+    *diagnostics = DisplayIndexUpdateDiagnostics{};
+
+  // Start with the deliberately narrow common case. A failed eligibility
+  // check is not an error: the caller immediately uses the full rebuild as the
+  // correctness oracle. This path can be widened independently once each
+  // additional edit/fold topology has differential coverage.
+  if (!analysis_ || !analysis || edits.size() != 1 || !folds_.empty() ||
+      !folds.empty() || rows_.empty())
+    return false;
+  const RevisionEditBatch &batch = edits.front();
+  if (batch.before != analysis_ || batch.after != analysis ||
+      batch.edits.size() != 8 ||
+      analysis_->line_starts.size() != analysis->line_starts.size() ||
+      analysis->line_starts.empty() || reader.size() != analysis->utf16_length)
+    return false;
+
+  const Point old_start{batch.edits[0], batch.edits[1]};
+  const Point old_end{batch.edits[2], batch.edits[3]};
+  const Point new_start{batch.edits[4], batch.edits[5]};
+  const Point new_end{batch.edits[6], batch.edits[7]};
+  if (old_start != new_start || old_start.row != old_end.row ||
+      old_start.row != new_end.row || old_start.row >= analysis_->line_starts.size() ||
+      old_start.row >= analysis->line_starts.size() || old_end < old_start ||
+      new_end < new_start)
+    return false;
+
+  const uint64_t buffer_row = old_start.row;
+  const uint64_t old_line_length =
+      analysis_->line_ends[buffer_row] - analysis_->line_starts[buffer_row];
+  const uint64_t new_line_length =
+      analysis->line_ends[buffer_row] - analysis->line_starts[buffer_row];
+  if (old_start.column > old_line_length || old_end.column > old_line_length ||
+      new_start.column > new_line_length || new_end.column > new_line_length)
+    return false;
+
+  const auto line_begin_iterator =
+      std::lower_bound(rows_.begin(), rows_.end(), buffer_row,
+                       [](const ScreenRow &row, uint64_t value) {
+                         return row.buffer_start.row < value;
+                       });
+  const auto line_end_iterator =
+      std::upper_bound(line_begin_iterator, rows_.end(), buffer_row,
+                       [](uint64_t value, const ScreenRow &row) {
+                         return value < row.buffer_start.row;
+                       });
+  if (line_begin_iterator == line_end_iterator)
+    return false;
+  const size_t line_begin =
+      static_cast<size_t>(line_begin_iterator - rows_.begin());
+  const size_t line_end =
+      static_cast<size_t>(line_end_iterator - rows_.begin());
+  uint64_t candidate = candidate_screen_row(old_start);
+  if (candidate < line_begin || candidate >= line_end)
+    return false;
+
+  // Include one preceding row so an edit at a wrap boundary can change a
+  // surrogate/combining pair or the boundary choice of that row. Restart from
+  // the logical-line beginning while it is still in leading whitespace;
+  // continuation indentation is otherwise a stable state carried by the row.
+  size_t rebuild_start = static_cast<size_t>(candidate);
+  if (rebuild_start > line_begin)
+    rebuild_start--;
+  if (rows_[rebuild_start].starts_in_leading_whitespace)
+    rebuild_start = line_begin;
+  // Reflowing from the beginning of the only logical line cannot reuse any
+  // indexed geometry. Let the established full rebuild handle that case
+  // without first allocating and copying an incremental replacement vector.
+  if (rebuild_start == 0 && line_end == rows_.size())
+    return false;
+  const Point rebuild_point = rows_[rebuild_start].buffer_start;
+  if (rebuild_point.row != buffer_row || old_start < rebuild_point)
+    return false;
+
+  DisplayIndex replacement(options_);
+  replacement.analysis_ = analysis;
+  uint64_t source_row = buffer_row;
+  size_t fold_index = 0;
+  LogicalLine line = replacement.build_logical_line(source_row, fold_index);
+  if (line.segments.size() > 1 ||
+      (!line.segments.empty() &&
+       line.segments.front().kind != DisplaySpan::Kind::Source))
+    return false;
+
+  UnitCursor cursor = replacement.begin_cursor(line);
+  if (!line.segments.empty()) {
+    const LogicalSegment &segment = line.segments.front();
+    const uint64_t rebuild_offset =
+        analysis_offset_for_point(*analysis, rebuild_point);
+    if (rebuild_offset < segment.start_offset ||
+        rebuild_offset > segment.end_offset)
+      return false;
+    cursor = UnitCursor{0, rebuild_offset};
+    replacement.normalize_cursor(line, cursor);
+  }
+  const bool partial_line = rebuild_start != line_begin;
+  replacement.wrap_logical_line_from(
+      reader, line, cursor, rows_[rebuild_start].leading_indent,
+      rows_[rebuild_start].starts_in_leading_whitespace, partial_line,
+      rows_[rebuild_start].leading_indent);
+  if (replacement.rows_.empty() ||
+      replacement.rows_.front().buffer_start != rebuild_point)
+    return false;
+
+  std::vector<ScreenRow> updated_rows;
+  updated_rows.reserve(rebuild_start + replacement.rows_.size() +
+                       (rows_.size() - line_end));
+  updated_rows.insert(updated_rows.end(), rows_.begin(),
+                      rows_.begin() + rebuild_start);
+  updated_rows.insert(updated_rows.end(),
+                      std::make_move_iterator(replacement.rows_.begin()),
+                      std::make_move_iterator(replacement.rows_.end()));
+  const size_t suffix_start = updated_rows.size();
+  updated_rows.insert(updated_rows.end(), rows_.begin() + line_end, rows_.end());
+
+  // Later buffer rows retain their point geometry because this first version
+  // accepts no line-count changes. Their absolute snapshot offsets do move, so
+  // refresh those compact source-span offsets against the new analysis.
+  for (size_t row_index = suffix_start; row_index < updated_rows.size();
+       row_index++) {
+    for (DisplaySpan &span : updated_rows[row_index].spans) {
+      if (span.kind != DisplaySpan::Kind::Source)
+        return false;
+      span.start_offset = analysis_offset_for_point(*analysis, span.start);
+      span.end_offset = analysis_offset_for_point(*analysis, span.end);
+    }
+  }
+
+  std::vector<uint64_t> leading = leading_whitespace_ends_;
+  std::vector<uint64_t> trailing = trailing_whitespace_starts_;
+  if (leading.size() != analysis->line_starts.size() ||
+      trailing.size() != analysis->line_starts.size())
+    return false;
+  const uint64_t line_start = analysis->line_starts[buffer_row];
+  const uint64_t line_finish = analysis->line_ends[buffer_row];
+  uint64_t leading_offset = line_start;
+  while (leading_offset < line_finish) {
+    const char16_t character = reader.character_at(leading_offset);
+    if (character != u' ' && character != u'\t')
+      break;
+    leading_offset++;
+  }
+  uint64_t trailing_offset = line_finish;
+  while (trailing_offset > line_start) {
+    const char16_t character = reader.character_at(trailing_offset - 1);
+    if (character != u' ' && character != u'\t')
+      break;
+    trailing_offset--;
+  }
+  if (!reader.valid())
+    return false;
+  leading[buffer_row] = leading_offset - line_start;
+  trailing[buffer_row] = trailing_offset - line_start;
+
+  const uint64_t rebuilt_rows = replacement.rows_.size();
+  const uint64_t reused_rows = updated_rows.size() - rebuilt_rows;
+  analysis_ = std::move(analysis);
+  folds_.clear();
+  rows_ = std::move(updated_rows);
+  leading_whitespace_ends_ = std::move(leading);
+  trailing_whitespace_starts_ = std::move(trailing);
+  layout_units_scanned_ = replacement.layout_units_scanned_;
+  peak_logical_segments_ = std::max<uint64_t>(1, peak_logical_segments_);
+  peak_row_spans_ =
+      std::max<uint64_t>(replacement.peak_row_spans_, peak_row_spans_);
+  if (diagnostics != nullptr) {
+    diagnostics->screen_rows_rebuilt = rebuilt_rows;
+    diagnostics->screen_rows_reused = reused_rows;
+    diagnostics->layout_units_scanned = layout_units_scanned_;
+  }
+  return true;
 }
 
 uint64_t DisplayIndex::line_length(uint64_t row) const {
@@ -669,40 +898,56 @@ uint64_t DisplayIndex::source_screen_column(const SnapshotReader &reader,
 
 Point DisplayIndex::screen_for_visible_point(const SnapshotReader &reader,
                                              Point point) const {
+  const uint64_t row_index = candidate_screen_row(point);
+  if (row_index >= rows_.size()) {
+    if (rows_.empty())
+      return Point{};
+    return Point{rows_.size() - 1, rows_.back().visual_width};
+  }
+
   Point candidate{};
   bool found = false;
-  for (uint64_t row_index = 0; row_index < rows_.size(); row_index++) {
-    const ScreenRow &screen_row = rows_[row_index];
-    if (point == screen_row.buffer_start) {
-      candidate = Point{row_index, screen_row.leading_indent};
+  const ScreenRow &screen_row = rows_[row_index];
+  if (point == screen_row.buffer_start) {
+    candidate = Point{row_index, screen_row.leading_indent};
+    found = true;
+  }
+  for (const DisplaySpan &span : screen_row.spans) {
+    if (point == span.start) {
+      candidate = Point{row_index, span.screen_start};
       found = true;
     }
-    for (const DisplaySpan &span : screen_row.spans) {
-      if (point == span.start) {
-        candidate = Point{row_index, span.screen_start};
-        found = true;
-      }
-      if (span.kind == DisplaySpan::Kind::Source && span.start < point &&
-          point < span.end && point.row == span.start.row) {
-        candidate =
-            Point{row_index, source_screen_column(reader, span, point)};
-        found = true;
-      }
-      if (point == span.end) {
-        candidate = Point{row_index, span.screen_end};
-        found = true;
-      }
+    if (span.kind == DisplaySpan::Kind::Source && span.start < point &&
+        point < span.end && point.row == span.start.row) {
+      candidate = Point{row_index, source_screen_column(reader, span, point)};
+      found = true;
     }
-    if (point == screen_row.buffer_end) {
-      candidate = Point{row_index, screen_row.visual_width};
+    if (point == span.end) {
+      candidate = Point{row_index, span.screen_end};
       found = true;
     }
   }
+  if (point == screen_row.buffer_end) {
+    candidate = Point{row_index, screen_row.visual_width};
+    found = true;
+  }
   if (found)
     return candidate;
-  if (rows_.empty())
-    return Point{};
   return Point{rows_.size() - 1, rows_.back().visual_width};
+}
+
+uint64_t DisplayIndex::candidate_screen_row(Point point) const {
+  const auto candidate = std::upper_bound(
+      rows_.begin(), rows_.end(), point,
+      [](const Point &value, const ScreenRow &row) {
+        return value < row.buffer_start;
+      });
+  if (candidate == rows_.begin())
+    return rows_.size();
+  const auto row = candidate - 1;
+  if (row->buffer_end < point)
+    return rows_.size();
+  return static_cast<uint64_t>(row - rows_.begin());
 }
 
 Point DisplayIndex::buffer_to_screen(const SnapshotReader &reader, Point point,
@@ -719,7 +964,8 @@ Point DisplayIndex::buffer_to_screen(const SnapshotReader &reader, Point point,
         if (to_end < from_start)
           use_end = true;
       }
-      for (uint64_t row_index = 0; row_index < rows_.size(); row_index++) {
+      const uint64_t row_index = candidate_screen_row(fold.range.start);
+      if (row_index < rows_.size()) {
         for (const DisplaySpan &span : rows_[row_index].spans) {
           if (span.kind == DisplaySpan::Kind::FoldPlaceholder &&
               span.start == fold.range.start && span.end == fold.range.end) {

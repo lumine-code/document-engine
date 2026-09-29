@@ -230,9 +230,16 @@ void display_view_accept_revision(
           : std::move(state->pending_line_identities);
   std::vector<RevisionEditBatch> batches;
   if (old_analysis && new_analysis && !packed_edits.empty()) {
-    batches.push_back(
-        RevisionEditBatch{revision > 0 ? revision - 1 : 0, revision,
-                          packed_edits, old_analysis, new_analysis});
+    RevisionEditBatch batch{revision > 0 ? revision - 1 : 0, revision,
+                            packed_edits, old_analysis, new_analysis};
+    batches.push_back(batch);
+    if (state->pending_display_edits_eligible &&
+        state->pending_display_edits.empty()) {
+      state->pending_display_edits.push_back(std::move(batch));
+    } else {
+      state->pending_display_edits.clear();
+      state->pending_display_edits_eligible = false;
+    }
     for (DisplayViewState::LineIdentity &identity : candidates) {
       if (!identity.initialized)
         continue;
@@ -247,6 +254,9 @@ void display_view_accept_revision(
       identity.buffer_start = analysis_point_for_offset(*new_analysis, start);
       identity.buffer_end = analysis_point_for_offset(*new_analysis, end);
     }
+  } else {
+    state->pending_display_edits.clear();
+    state->pending_display_edits_eligible = false;
   }
   state->pending_line_identities = std::move(candidates);
   state->accepted_edit_count += packed_edits.size() / 8;
@@ -736,12 +746,33 @@ bool DisplayViewWrapper::ensure_index(
       throw_error(env, reader.error().c_str(), "ERR_SNAPSHOT_LEASE");
       return false;
     }
+    DisplayIndexUpdateDiagnostics update_diagnostics;
+    const bool had_cached_index = state_->index_initialized;
+    const bool incrementally_updated =
+        had_cached_index && state_->pending_display_edits_eligible &&
+        state_->index->update(reader, *analysis, state_->folds,
+                              state_->pending_display_edits,
+                              &update_diagnostics);
+    if (!reader.valid()) {
+      throw_error(env, reader.error().c_str(), "ERR_SNAPSHOT_LEASE");
+      return false;
+    }
+    if (!incrementally_updated &&
+        !state_->index->rebuild(reader, *analysis, state_->folds)) {
+      throw_error(env, reader.error().c_str(), "ERR_SNAPSHOT_LEASE");
+      return false;
+    }
+    if (!reader.valid()) {
+      throw_error(env, reader.error().c_str(), "ERR_SNAPSHOT_LEASE");
+      return false;
+    }
     std::vector<DisplayViewState::LineIdentity> candidates =
         state_->pending_line_identities.empty()
             ? state_->line_identities
             : std::move(state_->pending_line_identities);
     state_->pending_line_identities.clear();
-    state_->index->rebuild(reader, *analysis, state_->folds);
+    state_->pending_display_edits.clear();
+    state_->pending_display_edits_eligible = true;
     std::unordered_multimap<LineRangeKey, DisplayViewState::LineIdentity,
                             LineRangeKeyHash>
         candidates_by_range;
@@ -791,12 +822,27 @@ bool DisplayViewWrapper::ensure_index(
     state_->line_identities = std::move(reconciled);
     state_->cached_buffer_revision = revision;
     state_->cached_fold_generation = state_->fold_generation;
+    state_->index_initialized = true;
     state_->display_revision++;
-    state_->index_rebuild_count++;
-    state_->index_rebuild_milliseconds +=
+    const double elapsed =
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - rebuild_started_at)
             .count();
+    if (incrementally_updated) {
+      state_->index_incremental_update_count++;
+      state_->index_incremental_update_milliseconds += elapsed;
+      state_->index_incremental_rows_rebuilt +=
+          update_diagnostics.screen_rows_rebuilt;
+      state_->index_incremental_rows_reused +=
+          update_diagnostics.screen_rows_reused;
+      state_->index_incremental_layout_units_scanned +=
+          update_diagnostics.layout_units_scanned;
+    } else {
+      state_->index_rebuild_count++;
+      state_->index_rebuild_milliseconds += elapsed;
+      if (had_cached_index)
+        state_->index_incremental_fallback_count++;
+    }
   }
   return true;
 }
@@ -1278,6 +1324,24 @@ Napi::Value DisplayViewWrapper::get_diagnostics(
              Napi::Number::New(env, state_->index_rebuild_count));
   result.Set("indexRebuildMilliseconds",
              Napi::Number::New(env, state_->index_rebuild_milliseconds));
+  result.Set("indexIncrementalUpdateCount",
+             Napi::Number::New(env,
+                               state_->index_incremental_update_count));
+  result.Set("indexIncrementalFallbackCount",
+             Napi::Number::New(env,
+                               state_->index_incremental_fallback_count));
+  result.Set("indexIncrementalUpdateMilliseconds",
+             Napi::Number::New(
+                 env, state_->index_incremental_update_milliseconds));
+  result.Set("indexIncrementalRowsRebuilt",
+             Napi::Number::New(env,
+                               state_->index_incremental_rows_rebuilt));
+  result.Set("indexIncrementalRowsReused",
+             Napi::Number::New(env,
+                               state_->index_incremental_rows_reused));
+  result.Set("indexIncrementalLayoutUnitsScanned",
+             Napi::Number::New(
+                 env, state_->index_incremental_layout_units_scanned));
   result.Set("renderPlanCount",
              Napi::Number::New(env, state_->render_plan_count));
   result.Set("renderPlanMilliseconds",

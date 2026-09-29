@@ -100,7 +100,8 @@
         "src/syntax/query-snapshot-cache.cc",
         "src/syntax/scope-resolver.cc",
         "src/syntax/syntax-backend.cc",
-        "src/text-bridge/snapshot-reader.cc"
+        "src/text-bridge/snapshot-reader.cc",
+        "src/testing/snapshot-lease-test-provider.cc"
       ],
       "include_dirs": [
         "src",

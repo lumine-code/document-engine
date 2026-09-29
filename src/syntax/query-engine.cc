@@ -548,11 +548,44 @@ bool node_text(const SnapshotReader &reader, TSNode node,
   return true;
 }
 
+bool node_text_utf16(const SnapshotReader &reader, TSNode node,
+                     std::u16string &output) {
+  const uint32_t start_byte = ts_node_start_byte(node);
+  const uint32_t end_byte = ts_node_end_byte(node);
+  return (start_byte & 1u) == 0 && (end_byte & 1u) == 0 &&
+         start_byte <= end_byte &&
+         reader.append_range(start_byte / 2u, end_byte / 2u, output);
+}
+
 bool text_predicate_passes(const TextPredicate &predicate,
                            const SnapshotReader &reader,
                            const TSQueryMatch &match) {
   if (!predicate.resolved)
     return false;
+  if (predicate.kind == TextPredicateKind::Match) {
+    bool found = false;
+    std::u16string text;
+    for (uint16_t index = 0; index < match.capture_count; index++) {
+      const TSQueryCapture &capture = match.captures[index];
+      if (capture.index != predicate.first_capture)
+        continue;
+      found = true;
+      text.clear();
+      if (!node_text_utf16(reader, capture.node, text))
+        return false;
+      JsRegex::Match regex_match;
+      const bool matched = predicate.regex &&
+                           predicate.regex->search(text, regex_match);
+      const bool accepted = predicate.positive ? matched : !matched;
+      if (predicate.match_all && !accepted)
+        return false;
+      if (!predicate.match_all && accepted)
+        return true;
+    }
+    if (!found)
+      return !predicate.positive;
+    return predicate.match_all;
+  }
   std::vector<std::string> first;
   std::vector<std::string> second;
   for (uint16_t index = 0; index < match.capture_count; index++) {
@@ -583,39 +616,6 @@ bool text_predicate_passes(const TextPredicate &predicate,
                          [&](const std::string &right) {
                            return compare(left, right);
                          });
-    };
-    return predicate.match_all
-               ? std::all_of(first.begin(), first.end(), matches)
-               : std::any_of(first.begin(), first.end(), matches);
-  }
-
-  if (predicate.kind == TextPredicateKind::Match) {
-    if (first.empty())
-      return !predicate.positive;
-    auto matches = [&](const std::string &text) {
-      std::u16string utf16;
-      const uint32_t start_byte = 0;
-      (void)start_byte;
-      // `text` is UTF-8 because equality predicates also consume it. Convert
-      // through the source capture instead of matching byte offsets: JsRegex
-      // reports UTF-16 spans, exactly like JavaScript RegExp.
-      for (size_t index = 0; index < text.size();) {
-        const uint8_t first = static_cast<uint8_t>(text[index++]);
-        uint32_t codepoint = first;
-        size_t trailing = 0;
-        if ((first & 0xe0u) == 0xc0u) { codepoint = first & 0x1fu; trailing = 1; }
-        else if ((first & 0xf0u) == 0xe0u) { codepoint = first & 0x0fu; trailing = 2; }
-        else if ((first & 0xf8u) == 0xf0u) { codepoint = first & 0x07u; trailing = 3; }
-        for (size_t offset = 0; offset < trailing && index < text.size(); offset++)
-          codepoint = (codepoint << 6u) |
-                      (static_cast<uint8_t>(text[index++]) & 0x3fu);
-        if (codepoint <= 0xffffu) utf16.push_back(static_cast<char16_t>(codepoint));
-        else { codepoint -= 0x10000u; utf16.push_back(static_cast<char16_t>(0xd800u + (codepoint >> 10u))); utf16.push_back(static_cast<char16_t>(0xdc00u + (codepoint & 0x3ffu))); }
-      }
-      JsRegex::Match regex_match;
-      const bool matched = predicate.regex &&
-                           predicate.regex->search(utf16, regex_match);
-      return predicate.positive ? matched : !matched;
     };
     return predicate.match_all
                ? std::all_of(first.begin(), first.end(), matches)

@@ -54,10 +54,13 @@ function validateHeader(headerPath) {
   const source = fs.readFileSync(headerPath, 'utf8')
   const required = [
     /#define\s+SUPERSTRING_SNAPSHOT_LEASE_ABI_VERSION\s+1u\b/,
-    /SUPERSTRING_SNAPSHOT_SOURCE_TYPE_TAG/,
-    /SUPERSTRING_SNAPSHOT_LEASE_TYPE_TAG/,
+    /SUPERSTRING_SNAPSHOT_CURRENT_SOURCE_TYPE_TAG/,
+    /SUPERSTRING_SNAPSHOT_CURRENT_LEASE_TYPE_TAG/,
+    /SUPERSTRING_SNAPSHOT_LEGACY_EAGER_SOURCE_TYPE_TAG/,
+    /SUPERSTRING_SNAPSHOT_LEGACY_EAGER_LEASE_TYPE_TAG/,
     /typedef struct SuperstringSnapshotLease\b/,
     /typedef struct SuperstringSnapshotLeaseFunctions\b/,
+    /\(\*chunk_count\)\s*\(/,
     /superstring_snapshot_lease_acquire\s*\(/,
   ]
   for (const pattern of required) {

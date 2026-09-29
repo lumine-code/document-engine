@@ -20,6 +20,7 @@ struct LayeredQueryContext {
   QueryResolutionContext defaults;
   std::map<std::string, QueryResolutionContext> by_grammar;
   bool include_language_scopes = true;
+  bool include_node_handles = true;
 };
 
 bool execute_layered_query(

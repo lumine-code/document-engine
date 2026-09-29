@@ -1099,13 +1099,20 @@ Napi::Value DocumentSessionWrapper::apply_revision(
     analyzed = true;
     incremental_analysis = true;
   } else if (previous_analysis != nullptr && request->edits.size() == 8) {
-    analyzed = reader.analyze_incremental(
-        *previous_analysis,
-        Point{request->edits[0], request->edits[1]},
-        Point{request->edits[2], request->edits[3]},
-        Point{request->edits[4], request->edits[5]},
-        Point{request->edits[6], request->edits[7]}, *analysis,
-        request->chunks_read);
+    const Point old_start{request->edits[0], request->edits[1]};
+    const Point old_end{request->edits[2], request->edits[3]};
+    const Point new_start{request->edits[4], request->edits[5]};
+    const Point new_end{request->edits[6], request->edits[7]};
+    if (state_->use_snapshot_line_index && reader.has_line_index()) {
+      analyzed = reader.analyze_line_index_incremental(
+          *previous_analysis, old_start, old_end, new_start, new_end,
+          *analysis, request->lines_read);
+    }
+    if (!analyzed) {
+      analyzed = reader.analyze_incremental(
+          *previous_analysis, old_start, old_end, new_start, new_end,
+          *analysis, request->chunks_read);
+    }
     incremental_analysis = analyzed;
   } else if (previous_analysis != nullptr && request->edits.size() > 8 &&
              state_->use_snapshot_line_index && reader.has_line_index()) {
@@ -1797,6 +1804,7 @@ Napi::Value DocumentSessionWrapper::get_query_captures(
     layered_context.defaults = resolution;
     layered_context.by_grammar = std::move(resolutions_by_grammar);
     layered_context.include_language_scopes = include_language_scopes;
+    layered_context.include_node_handles = !compact_highlights;
     if (!execute_layered_query(
             canonical, published_syntax, injection_sources, reader,
             *syntax_analysis, *output_analysis, projection, buffer_revision,

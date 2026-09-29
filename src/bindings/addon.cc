@@ -3,6 +3,7 @@
 #include "bindings/document-session.h"
 #include "syntax/injection-engine.h"
 #include "syntax/syntax-backend.h"
+#include "testing/snapshot-lease-test-provider.h"
 
 #include <napi.h>
 
@@ -135,6 +136,8 @@ Napi::Object init_addon(Napi::Env env, Napi::Object exports) {
     return exports;
   }
   env.SetInstanceData<AddonData>(data);
+
+  install_snapshot_lease_test_provider(env, exports);
 
   Napi::Function display_view = DisplayViewWrapper::init(env);
   data->display_view_constructor = Napi::Persistent(display_view);

@@ -74,13 +74,24 @@ struct IndexedDisplaySummary {
   Point rightmost_screen_position;
 };
 
+struct DisplayIndexUpdateDiagnostics {
+  uint64_t screen_rows_rebuilt = 0;
+  uint64_t screen_rows_reused = 0;
+  uint64_t layout_units_scanned = 0;
+};
+
 class DisplayIndex {
 public:
   explicit DisplayIndex(DisplayIndexOptions options);
 
-  void rebuild(const SnapshotReader &reader,
+  bool rebuild(const SnapshotReader &reader,
                std::shared_ptr<const SnapshotAnalysis> analysis,
                const std::unordered_map<uint32_t, Fold> &folds);
+  bool update(const SnapshotReader &reader,
+              std::shared_ptr<const SnapshotAnalysis> analysis,
+              const std::unordered_map<uint32_t, Fold> &folds,
+              const std::vector<RevisionEditBatch> &edits,
+              DisplayIndexUpdateDiagnostics *diagnostics = nullptr);
 
   Point buffer_to_screen(const SnapshotReader &reader, Point point,
                          ClipDirection clip) const;
@@ -133,6 +144,10 @@ private:
   static std::vector<Fold>
   normalized_folds(const SnapshotAnalysis &analysis,
                    const std::unordered_map<uint32_t, Fold> &folds);
+  void rebuild_in_place(const SnapshotReader &reader,
+                        std::shared_ptr<const SnapshotAnalysis> analysis,
+                        const std::unordered_map<uint32_t, Fold> &folds);
+  void adopt_state(DisplayIndex &&replacement);
   LogicalLine build_logical_line(uint64_t &row, size_t &fold_index) const;
   void append_source_segment(LogicalLine &line, Point start, Point end) const;
 
@@ -144,6 +159,13 @@ private:
                  UnitCursor &cursor, DisplayUnit &unit);
   void wrap_logical_line(const SnapshotReader &reader,
                          const LogicalLine &line);
+  void wrap_logical_line_from(const SnapshotReader &reader,
+                              const LogicalLine &line,
+                              UnitCursor logical_start,
+                              uint32_t leading_indent,
+                              bool starts_in_leading_whitespace,
+                              bool continuation_indent_is_fixed,
+                              uint32_t fixed_continuation_indent);
   void append_screen_row(const SnapshotReader &reader,
                          const LogicalLine &line, UnitCursor start,
                          UnitCursor end, uint32_t leading_indent,
@@ -154,6 +176,7 @@ private:
   Point clamp_buffer_point(Point point) const;
   Point clip_buffer_point(const SnapshotReader &reader, Point point,
                           ClipDirection clip) const;
+  uint64_t candidate_screen_row(Point point) const;
   Point screen_for_visible_point(const SnapshotReader &reader,
                                  Point point) const;
   uint64_t source_screen_column(const SnapshotReader &reader,

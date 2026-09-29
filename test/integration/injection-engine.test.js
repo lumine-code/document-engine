@@ -87,6 +87,14 @@ class FakeGrammar {
     for (const listener of this.addListeners) listener(point)
   }
 
+  removeInjectionPoint(point) {
+    const points = this.injectionPointsByType[point.type] ?? []
+    const index = points.indexOf(point)
+    if (index !== -1) points.splice(index, 1)
+    if (points.length === 0) delete this.injectionPointsByType[point.type]
+    for (const listener of this.removeListeners) listener(point)
+  }
+
   onDidAddInjectionPoint(callback) {
     this.addListeners.add(callback)
     return {dispose: () => this.addListeners.delete(callback)}
@@ -255,6 +263,15 @@ test('packs native candidates with resolvable handles', async () => {
       },
     ],
   })
+  assert.equal(batch.queryLayerCount, 0)
+  for (const field of [
+    'candidateQueueMilliseconds',
+    'candidateScanMilliseconds',
+    'candidatePackMilliseconds',
+  ]) {
+    assert.ok(Number.isFinite(batch[field]))
+    assert.ok(batch[field] >= 0)
+  }
   const candidates = decodeCandidates(batch)
   assert.equal(candidates.length, 2)
   assert.deepEqual(
@@ -268,6 +285,121 @@ test('packs native candidates with resolvable handles', async () => {
     requestId: batch.requestId,
     reason: 'test-complete',
   })
+  await session.destroy()
+})
+
+test('deduplicates handle caches when candidate scans race', async () => {
+  const declarationCount = 2000
+  const buffer = new TextBuffer(
+    Array.from(
+      {length: declarationCount},
+      (_, index) => `const value_${index} = ${index}`,
+    ).join('\n'),
+  )
+  const session = new DocumentSession()
+  session.setLanguage(descriptor('source.js', javascriptWasm, 'javascript'))
+  await apply(session, buffer, 1)
+  const tags = revisionTags(session)
+  const request = {
+    ...tags,
+    injectionPointGeneration: 1,
+    grammars: [
+      {
+        grammarId: 'source.js',
+        types: ['lexical_declaration'],
+        registrations: [],
+      },
+    ],
+  }
+
+  const batches = await Promise.all(
+    Array.from({length: 4}, () => session.getInjectionCandidates(request)),
+  )
+  for (const batch of batches) {
+    assert.equal(decodeCandidates(batch).length, declarationCount)
+    session.abortInjectionRequest({
+      ...tags,
+      requestId: batch.requestId,
+      reason: 'test-complete',
+    })
+  }
+
+  const cached = await session.getInjectionCandidates(request)
+  assert.equal(decodeCandidates(cached).length, declarationCount)
+  session.abortInjectionRequest({
+    ...tags,
+    requestId: cached.requestId,
+    reason: 'test-complete',
+  })
+  await session.destroy()
+})
+
+test('reports injection topology changes without invalidating stable empty results', async () => {
+  const buffer = new TextBuffer('alpha\nbeta\n')
+  const session = new DocumentSession()
+  const root = new FakeGrammar(
+    'source.js',
+    descriptor('source.js', javascriptWasm, 'javascript'),
+  )
+  const html = new FakeGrammar(
+    'text.html.basic',
+    descriptor('text.html.basic', htmlWasm, 'html'),
+    ['html'],
+  )
+  const todo = new FakeGrammar(
+    'text.todo',
+    descriptor('text.todo', todoWasm, 'TODO'),
+    ['todo'],
+  )
+  let languageName = 'html'
+  let contentRange = {
+    startIndex: 0,
+    endIndex: 5,
+    startPosition: {row: 0, column: 0},
+    endPosition: {row: 0, column: 5},
+  }
+  const injectionPoint = {
+    type: 'program',
+    language: () => languageName,
+    content: () => contentRange,
+    includeChildren: true,
+  }
+  session.setLanguage(root.descriptor)
+  await apply(session, buffer, 1)
+  const bridge = new DynamicInjectionBridge({
+    engine: session,
+    buffer,
+    grammar: root,
+    resolveGrammar(name) {
+      if (name === 'html') return html
+      if (name === 'todo') return todo
+      return null
+    },
+    getCurrentTags: () => revisionTags(session),
+  })
+
+  const emptyResult = await bridge.synchronize()
+  assert.equal(emptyResult.topologyChanged, false)
+  root.addInjectionPoint(injectionPoint)
+  assert.equal((await bridge.synchronize()).topologyChanged, true)
+  assert.equal((await bridge.synchronize()).topologyChanged, true)
+
+  contentRange = {
+    startIndex: 6,
+    endIndex: 10,
+    startPosition: {row: 1, column: 0},
+    endPosition: {row: 1, column: 4},
+  }
+  assert.equal((await bridge.synchronize()).topologyChanged, true)
+
+  languageName = 'todo'
+  assert.equal((await bridge.synchronize()).topologyChanged, true)
+
+  root.removeInjectionPoint(injectionPoint)
+  assert.equal((await bridge.synchronize()).topologyChanged, true)
+  assert.equal((await bridge.synchronize()).topologyChanged, false)
+
+  bridge.destroy()
   await session.destroy()
 })
 

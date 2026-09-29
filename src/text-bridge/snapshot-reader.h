@@ -37,6 +37,11 @@ public:
       const std::vector<uint32_t> &packed_edits,
       SnapshotAnalysis &analysis,
       uint64_t &lines_read) const;
+  bool analyze_line_index_incremental(
+      const SnapshotAnalysis &previous,
+      const Point &old_start, const Point &old_end,
+      const Point &new_start, const Point &new_end,
+      SnapshotAnalysis &analysis, uint64_t &lines_read) const;
   bool analyze(SnapshotAnalysis &analysis, uint64_t &chunks_read,
                SnapshotCancellationFunction cancellation = nullptr,
                void *cancellation_payload = nullptr) const;
@@ -53,14 +58,23 @@ private:
     const uint16_t *data = nullptr;
     uint64_t start = 0;
     uint64_t length = 0;
+    uint64_t index = 0;
   };
 
-  const Chunk *chunk_for_offset(uint64_t offset) const;
+  bool ensure_chunk_count() const;
+  bool read_chunk(uint64_t index, Chunk *result) const;
+  bool chunk_for_offset(uint64_t offset, Chunk *result) const;
+  bool validate_adjacent_chunks(const Chunk &left, const Chunk &right) const;
+  void cache_chunk(const Chunk &chunk) const;
+  void set_error(const char *message) const;
 
   const SuperstringSnapshotLease *lease_ = nullptr;
-  std::vector<Chunk> chunks_;
   uint64_t size_ = 0;
-  std::string error_;
+  mutable uint64_t chunk_count_ = 0;
+  mutable bool has_chunk_count_ = false;
+  mutable Chunk cached_chunk_;
+  mutable bool has_cached_chunk_ = false;
+  mutable std::string error_;
 };
 
 } // namespace document_engine

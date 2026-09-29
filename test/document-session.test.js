@@ -63,19 +63,78 @@ test('publishes plain text without queueing the syntax worker', async () => {
 
 test('falls back to base SnapshotLease chunk analysis without the line-index extension', async () => {
   const buffer = new TextBuffer('one\r\ntwo\n')
+  buffer.setTextInRange(
+    {start: {row: 0, column: 1}, end: {row: 0, column: 1}},
+    'FIRST',
+  )
+  buffer.setTextInRange(
+    {start: {row: 1, column: 1}, end: {row: 1, column: 1}},
+    'SECOND',
+  )
   const session = new DocumentSession({disableSnapshotLineIndex: true})
   await applyText(session, buffer, 1)
   const diagnostics = session.getDiagnostics()
   assert.equal(diagnostics.synchronousLineIndexAnalyses, 0)
   assert.equal(diagnostics.synchronousFullAnalyses, 1)
-  assert.ok(diagnostics.snapshotChunksRead > 0)
+  assert.ok(diagnostics.snapshotChunksRead > 1)
   assert.equal(diagnostics.snapshotLinesRead, 0)
+  await session.destroy()
+})
+
+test('updates one-edit line metadata without reading deferred chunks', async () => {
+  const buffer = new TextBuffer('a\r\n😀b\nlast')
+  const session = new DocumentSession()
+  const view = session.createDisplayView()
+  await applyText(session, buffer, 1)
+  const initialChunksRead = session.getDiagnostics().snapshotChunksRead
+
+  const applyEdit = async (revision, range, text, packed) => {
+    buffer.setTextInRange(range, text)
+    const snapshot = buffer.getSnapshot()
+    const result = session.applyRevision(
+      snapshot,
+      new Uint32Array(packed),
+      revision,
+    )
+    snapshot.destroy()
+    assert.equal((await result).accepted, true)
+  }
+
+  await applyEdit(
+    2,
+    {start: {row: 1, column: 2}, end: {row: 1, column: 2}},
+    'X\n',
+    [1, 2, 1, 2, 1, 2, 2, 0],
+  )
+  await applyEdit(
+    3,
+    {start: {row: 0, column: 1}, end: {row: 1, column: 0}},
+    '',
+    [0, 1, 1, 0, 0, 1, 0, 1],
+  )
+  await applyEdit(
+    4,
+    {start: {row: 0, column: 1}, end: {row: 0, column: 3}},
+    '界',
+    [0, 1, 0, 3, 0, 1, 0, 2],
+  )
+
+  const diagnostics = session.getDiagnostics()
+  assert.equal(diagnostics.snapshotChunksRead, initialChunksRead)
+  assert.ok(diagnostics.snapshotLinesRead >= 3)
+  assert.equal(diagnostics.synchronousFullAnalyses, 0)
+  assert.deepEqual(
+    view.buildRenderPlan(0, 10).lines.map((line) => line.lineText),
+    ['a界X', 'b', 'last'],
+  )
   await session.destroy()
 })
 
 test('keeps at most one active and one latest pending revision', async () => {
   const buffer = new TextBuffer('one')
   const session = new DocumentSession({workerDelayMs: 25})
+  const materializedBefore =
+    _getSnapshotLeaseDiagnostics().materializedChunkTablesTotal
 
   const first = applyText(session, buffer, 1)
   buffer.setText('two')
@@ -97,6 +156,11 @@ test('keeps at most one active and one latest pending revision', async () => {
   assert.equal(diagnostics.pendingJobs, 0)
   assert.equal(diagnostics.revisionsSuperseded, 1)
   assert.equal(diagnostics.revisionsStale, 1)
+  const materializedAfter =
+    _getSnapshotLeaseDiagnostics().materializedChunkTablesTotal
+  if (materializedBefore != null && materializedAfter != null) {
+    assert.ok(materializedAfter - materializedBefore < 3)
+  }
 
   await session.destroy()
 })

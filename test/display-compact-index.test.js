@@ -58,3 +58,29 @@ test('indexes a one-million-unit line without retaining per-unit records', async
 
   await session.destroy()
 })
+
+test('does not rescan every source unit when a wrapped line contains a fold', async () => {
+  const length = 250_000
+  const buffer = new TextBuffer(
+    'alpha beta-gamma/delta '.repeat(11_000).slice(0, length),
+  )
+  const session = new DocumentSession()
+  await publish(session, buffer)
+  const view = session.createDisplayView({
+    wrapColumn: 500,
+    wrapBoundaryMode: 'standard',
+  })
+  const foldStart = Math.floor(length / 3)
+  view.replaceFolds(
+    1,
+    1,
+    new Uint32Array([1, 0, foldStart, 0, foldStart + 1000]),
+  )
+
+  view.buildRenderPlan(0, 50)
+  const diagnostics = view.getDiagnostics()
+  assert.ok(diagnostics.layoutUnitsScanned < length * 1.05)
+  assert.ok(diagnostics.peakLogicalSegments >= 3)
+
+  await session.destroy()
+})

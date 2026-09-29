@@ -316,9 +316,11 @@ bool execute_layered_query(
       // depth and then this order, so the grammar scope must wrap every query
       // scope that starts at the same position.
       capture.order = 1 + original_order++;
-      capture.node_handle = source.syntax->handle_for_range(
-          capture.node_start_index, capture.node_end_index,
-          capture.node_symbol);
+      if (context.include_node_handles) {
+        capture.node_handle = source.syntax->handle_for_range(
+            capture.node_start_index, capture.node_end_index,
+            capture.node_symbol);
+      }
       for (uint32_t range_index = 0; range_index < source.ranges.size();
            range_index++) {
         const IndexedRange &included = source.ranges[range_index];
