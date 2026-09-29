@@ -138,6 +138,26 @@ test('builds viewport-only render lines and preserves the compatibility shape', 
   await session.destroy()
 })
 
+test('retains carried layout width while re-expanding tabs after word-boundary wraps', async () => {
+  for (const {text, lines} of [
+    {text: 'a bbbbbb\t x', lines: ['a ', 'bbbbbb       x']},
+    {text: 'abc def\t def ', lines: ['abc ', 'def    ', 'def ']},
+  ]) {
+    const buffer = new TextBuffer(text)
+    const session = new DocumentSession()
+    const view = session.createDisplayView({wrapColumn: 12, tabLength: 6})
+    try {
+      await publish(session, buffer, 1)
+      assert.deepEqual(
+        view.buildRenderPlan(0, 10).lines.map((line) => line.lineText),
+        lines,
+      )
+    } finally {
+      await session.destroy()
+    }
+  }
+})
+
 test('renders fragmented snapshot storage like the same contiguous text', async () => {
   const fragmented = new TextBuffer(
     `${'alpha beta\tgamma/delta '.repeat(8)}\n${'tail '.repeat(20)}`,
@@ -405,6 +425,380 @@ test('bounds incremental reflow work by the edited soft-wrap suffix', async () =
     assert.ok(
       diagnostics.indexIncrementalLayoutUnitsScanned - previousUnits < 250,
     )
+
+    const equalLengthUnits = diagnostics.indexIncrementalLayoutUnitsScanned
+    const equalLengthColumn = buffer.lineLengthForRow(0) - 20
+    buffer.setTextInRange(
+      {
+        start: {row: 0, column: equalLengthColumn},
+        end: {row: 0, column: equalLengthColumn + 1},
+      },
+      'z',
+    )
+    const snapshot = buffer.getSnapshot()
+    await session.applyRevision(
+      snapshot,
+      new Uint32Array([
+        0,
+        equalLengthColumn,
+        0,
+        equalLengthColumn + 1,
+        0,
+        equalLengthColumn,
+        0,
+        equalLengthColumn + 1,
+      ]),
+      4,
+    )
+    snapshot.destroy()
+    view.buildRenderPlan(0, 1)
+    diagnostics = view.getDiagnostics()
+    assert.equal(diagnostics.indexInPlaceUpdateCount, 1)
+    assert.ok(
+      diagnostics.indexIncrementalLayoutUnitsScanned - equalLengthUnits < 250,
+    )
+  } finally {
+    await session.destroy()
+  }
+})
+
+test('updates equal-length rows in place without reconciling unrelated line identities', async () => {
+  const lineCount = 5000
+  const buffer = new TextBuffer(
+    Array.from({length: lineCount}, (_, row) => `row ${row} value`).join('\n'),
+  )
+  const session = new DocumentSession()
+  const view = session.createDisplayView({wrapColumn: 80})
+
+  try {
+    await publish(session, buffer, 1)
+    const before = view.buildRenderPlan(0, lineCount).lines
+    const editedRow = Math.floor(lineCount / 2)
+    const startColumn = 5
+    buffer.setTextInRange(
+      {
+        start: {row: editedRow, column: startColumn},
+        end: {row: editedRow, column: startColumn + 1},
+      },
+      'X',
+    )
+    const snapshot = buffer.getSnapshot()
+    await session.applyRevision(
+      snapshot,
+      new Uint32Array([
+        editedRow,
+        startColumn,
+        editedRow,
+        startColumn + 1,
+        editedRow,
+        startColumn,
+        editedRow,
+        startColumn + 1,
+      ]),
+      2,
+    )
+    snapshot.destroy()
+
+    const after = view.buildRenderPlan(0, lineCount).lines
+    const diagnostics = view.getDiagnostics()
+    assert.equal(diagnostics.indexIncrementalUpdateCount, 1)
+    assert.equal(diagnostics.indexInPlaceUpdateCount, 1)
+    assert.equal(diagnostics.indexIncrementalRowsRebuilt, 1)
+    assert.ok(diagnostics.indexIncrementalRowsReused >= lineCount - 1)
+    assert.notEqual(after[editedRow].id, before[editedRow].id)
+    for (const row of [0, editedRow - 1, editedRow + 1, lineCount - 1]) {
+      assert.equal(after[row].id, before[row].id)
+    }
+  } finally {
+    await session.destroy()
+  }
+})
+
+test('matches a forced rebuild for equal-length edits in wrapped tab and whitespace rows', async () => {
+  const text = 'stable before\n  alpha\tbeta gamma delta  \nstable after'
+  const incrementalBuffer = new TextBuffer(text)
+  const rebuiltBuffer = new TextBuffer(text)
+  const incrementalSession = new DocumentSession()
+  const rebuiltSession = new DocumentSession()
+  const options = {
+    wrapColumn: 13,
+    tabLength: 4,
+    softWrapHangingIndent: 2,
+    wrapBoundaryMode: 'standard',
+  }
+  const incrementalView = incrementalSession.createDisplayView(options)
+  const rebuiltView = rebuiltSession.createDisplayView(options)
+
+  try {
+    await publish(incrementalSession, incrementalBuffer, 1)
+    await publish(rebuiltSession, rebuiltBuffer, 1)
+    const before = incrementalView.buildRenderPlan(
+      0,
+      incrementalView.getScreenLineCount(),
+    ).lines
+    const range = {start: {row: 1, column: 4}, end: {row: 1, column: 5}}
+    incrementalBuffer.setTextInRange(range, 'P')
+    rebuiltBuffer.setTextInRange(range, 'P')
+
+    let snapshot = incrementalBuffer.getSnapshot()
+    await incrementalSession.applyRevision(
+      snapshot,
+      new Uint32Array([1, 4, 1, 5, 1, 4, 1, 5]),
+      2,
+    )
+    snapshot.destroy()
+    snapshot = rebuiltBuffer.getSnapshot()
+    await rebuiltSession.applyRevision(snapshot, new Uint32Array(0), 2)
+    snapshot.destroy()
+
+    compareDisplayViews(incrementalView, rebuiltView, incrementalBuffer)
+    const after = incrementalView.buildRenderPlan(
+      0,
+      incrementalView.getScreenLineCount(),
+    ).lines
+    const diagnostics = incrementalView.getDiagnostics()
+    assert.equal(diagnostics.indexIncrementalUpdateCount, 1)
+    assert.equal(diagnostics.indexInPlaceUpdateCount, 1)
+    assert.equal(after[0].id, before[0].id)
+    assert.equal(after.at(-1).id, before.at(-1).id)
+    assert.ok(
+      after
+        .slice(1, -1)
+        .some((line, index) => line.id !== before[index + 1].id),
+    )
+  } finally {
+    await incrementalSession.destroy()
+    await rebuiltSession.destroy()
+  }
+})
+
+test('matches forced rebuilds for equal-length tabs, pairs, and whitespace classes', async () => {
+  const cases = [
+    {
+      name: 'wrap boundary',
+      line: 'ab-cdef',
+      range: [2, 3],
+      replacement: 'x',
+      options: {wrapColumn: 6, wrapBoundaryMode: 'standard'},
+    },
+    {
+      name: 'hard tab',
+      line: '\tabc def',
+      range: [0, 1],
+      replacement: ' ',
+      options: {wrapColumn: 20, tabLength: 6},
+    },
+    {
+      name: 'surrogate pair',
+      line: 'a😀bc',
+      range: [1, 3],
+      replacement: '🐍',
+      options: {wrapColumn: 20, characterWidthProfile: {doubleWidth: 2}},
+    },
+    {
+      name: 'combining pair',
+      line: 'e\u0301 abc',
+      range: [1, 2],
+      replacement: '\u0302',
+      options: {wrapColumn: 20},
+    },
+    {
+      name: 'leading whitespace',
+      line: 'xalpha x',
+      range: [0, 1],
+      replacement: ' ',
+      options: {wrapColumn: 20},
+    },
+    {
+      name: 'trailing whitespace',
+      line: 'xalpha x',
+      range: [7, 8],
+      replacement: ' ',
+      options: {wrapColumn: 20},
+    },
+  ]
+
+  for (const fixture of cases) {
+    const text = `before\n${fixture.line}\nafter`
+    const incrementalBuffer = new TextBuffer(text)
+    const rebuiltBuffer = new TextBuffer(text)
+    const incrementalSession = new DocumentSession()
+    const rebuiltSession = new DocumentSession()
+    const incrementalView = incrementalSession.createDisplayView(
+      fixture.options,
+    )
+    const rebuiltView = rebuiltSession.createDisplayView(fixture.options)
+    const [startColumn, endColumn] = fixture.range
+
+    try {
+      await publish(incrementalSession, incrementalBuffer, 1)
+      await publish(rebuiltSession, rebuiltBuffer, 1)
+      incrementalView.buildRenderPlan(0, incrementalView.getScreenLineCount())
+      rebuiltView.buildRenderPlan(0, rebuiltView.getScreenLineCount())
+      const range = {
+        start: {row: 1, column: startColumn},
+        end: {row: 1, column: endColumn},
+      }
+      incrementalBuffer.setTextInRange(range, fixture.replacement)
+      rebuiltBuffer.setTextInRange(range, fixture.replacement)
+
+      let snapshot = incrementalBuffer.getSnapshot()
+      await incrementalSession.applyRevision(
+        snapshot,
+        new Uint32Array([
+          1,
+          startColumn,
+          1,
+          endColumn,
+          1,
+          startColumn,
+          1,
+          startColumn + fixture.replacement.length,
+        ]),
+        2,
+      )
+      snapshot.destroy()
+      snapshot = rebuiltBuffer.getSnapshot()
+      await rebuiltSession.applyRevision(snapshot, new Uint32Array(0), 2)
+      snapshot.destroy()
+
+      compareDisplayViews(incrementalView, rebuiltView, incrementalBuffer)
+      assert.equal(
+        incrementalView.getDiagnostics().indexInPlaceUpdateCount,
+        1,
+        fixture.name,
+      )
+    } finally {
+      await incrementalSession.destroy()
+      await rebuiltSession.destroy()
+    }
+  }
+})
+
+test('rebuilds full wrapped-line state before an equal-length in-place update', async () => {
+  const target = '한 \t한😁\t-😀한한/😁a- 😀한-\t-a\u0301/中中😁😁b中\ta'
+  const text = `stable before\n${target}\nstable after`
+  const incrementalBuffer = new TextBuffer(text)
+  const rebuiltBuffer = new TextBuffer(text)
+  const incrementalSession = new DocumentSession()
+  const rebuiltSession = new DocumentSession()
+  const options = {
+    wrapColumn: 8,
+    tabLength: 2,
+    softWrapHangingIndent: 3,
+    wrapBoundaryMode: 'standard',
+    characterWidthProfile: {
+      default: 1,
+      doubleWidth: 1.5,
+      halfWidth: 1,
+      korean: 2,
+    },
+  }
+  const incrementalView = incrementalSession.createDisplayView(options)
+  const rebuiltView = rebuiltSession.createDisplayView(options)
+
+  try {
+    await publish(incrementalSession, incrementalBuffer, 1)
+    await publish(rebuiltSession, rebuiltBuffer, 1)
+    incrementalView.buildRenderPlan(0, incrementalView.getScreenLineCount())
+    rebuiltView.buildRenderPlan(0, rebuiltView.getScreenLineCount())
+    const range = {start: {row: 1, column: 8}, end: {row: 1, column: 10}}
+    incrementalBuffer.setTextInRange(range, '😁')
+    rebuiltBuffer.setTextInRange(range, '😁')
+
+    let snapshot = incrementalBuffer.getSnapshot()
+    await incrementalSession.applyRevision(
+      snapshot,
+      new Uint32Array([1, 8, 1, 10, 1, 8, 1, 10]),
+      2,
+    )
+    snapshot.destroy()
+    snapshot = rebuiltBuffer.getSnapshot()
+    await rebuiltSession.applyRevision(snapshot, new Uint32Array(0), 2)
+    snapshot.destroy()
+
+    compareDisplayViews(incrementalView, rebuiltView, incrementalBuffer)
+    assert.equal(incrementalView.getDiagnostics().indexInPlaceUpdateCount, 1)
+  } finally {
+    await incrementalSession.destroy()
+    await rebuiltSession.destroy()
+  }
+})
+
+test('restarts tab-sensitive unequal edits from the full logical line', async () => {
+  const text = 'head\n/caac-/\ntail'
+  const incrementalBuffer = new TextBuffer(text)
+  const rebuiltBuffer = new TextBuffer(text)
+  const incrementalSession = new DocumentSession()
+  const rebuiltSession = new DocumentSession()
+  const options = {
+    wrapColumn: 2,
+    tabLength: 7,
+    softWrapHangingIndent: 1,
+    wrapBoundaryMode: 'standard',
+  }
+  const incrementalView = incrementalSession.createDisplayView(options)
+  const rebuiltView = rebuiltSession.createDisplayView(options)
+
+  try {
+    await publish(incrementalSession, incrementalBuffer, 1)
+    await publish(rebuiltSession, rebuiltBuffer, 1)
+    incrementalView.buildRenderPlan(0, incrementalView.getScreenLineCount())
+    rebuiltView.buildRenderPlan(0, rebuiltView.getScreenLineCount())
+    const range = {start: {row: 1, column: 3}, end: {row: 1, column: 5}}
+    incrementalBuffer.setTextInRange(range, '\t')
+    rebuiltBuffer.setTextInRange(range, '\t')
+
+    let snapshot = incrementalBuffer.getSnapshot()
+    await incrementalSession.applyRevision(
+      snapshot,
+      new Uint32Array([1, 3, 1, 5, 1, 3, 1, 4]),
+      2,
+    )
+    snapshot.destroy()
+    snapshot = rebuiltBuffer.getSnapshot()
+    await rebuiltSession.applyRevision(snapshot, new Uint32Array(0), 2)
+    snapshot.destroy()
+
+    compareDisplayViews(incrementalView, rebuiltView, incrementalBuffer)
+    const diagnostics = incrementalView.getDiagnostics()
+    assert.equal(diagnostics.indexIncrementalUpdateCount, 1)
+    assert.equal(diagnostics.indexInPlaceUpdateCount, 0)
+    assert.equal(diagnostics.indexIncrementalFallbackCount, 0)
+  } finally {
+    await incrementalSession.destroy()
+    await rebuiltSession.destroy()
+  }
+})
+
+test('keeps the general incremental path when equal-length text changes wrap topology', async () => {
+  const buffer = new TextBuffer('aXbcdef\nstable')
+  const session = new DocumentSession()
+  const view = session.createDisplayView({
+    wrapColumn: 4,
+    tabLength: 4,
+    wrapBoundaryMode: 'none',
+  })
+
+  try {
+    await publish(session, buffer, 1)
+    assert.equal(view.getScreenLineCount(), 4)
+    buffer.setTextInRange(
+      {start: {row: 0, column: 1}, end: {row: 0, column: 2}},
+      '\t',
+    )
+    const snapshot = buffer.getSnapshot()
+    await session.applyRevision(
+      snapshot,
+      new Uint32Array([0, 1, 0, 2, 0, 1, 0, 2]),
+      2,
+    )
+    snapshot.destroy()
+
+    assert.equal(view.getScreenLineCount(), 5)
+    const diagnostics = view.getDiagnostics()
+    assert.equal(diagnostics.indexIncrementalUpdateCount, 1)
+    assert.equal(diagnostics.indexInPlaceUpdateCount, 0)
   } finally {
     await session.destroy()
   }

@@ -314,6 +314,7 @@ export interface DisplayViewDiagnostics {
   indexRebuildCount: number
   indexRebuildMilliseconds: number
   indexIncrementalUpdateCount: number
+  indexInPlaceUpdateCount: number
   indexIncrementalFallbackCount: number
   indexIncrementalUpdateMilliseconds: number
   indexIncrementalRowsRebuilt: number

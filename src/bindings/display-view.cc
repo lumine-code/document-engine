@@ -779,53 +779,106 @@ bool DisplayViewWrapper::ensure_index(
     state_->pending_line_identities.clear();
     state_->pending_display_edits.clear();
     state_->pending_display_edits_eligible = true;
-    std::unordered_multimap<LineRangeKey, DisplayViewState::LineIdentity,
-                            LineRangeKeyHash>
-        candidates_by_range;
-    for (const DisplayViewState::LineIdentity &identity : candidates) {
-      if (identity.initialized)
-        candidates_by_range.emplace(
-            LineRangeKey{identity.buffer_start, identity.buffer_end}, identity);
-    }
-    std::vector<DisplayViewState::LineIdentity> reconciled(
-        state_->index->row_count());
-    std::unordered_set<uint64_t> reconciled_ids;
-    for (uint64_t row = 0; row < state_->index->row_count(); row++) {
-      const ScreenRow *screen_row = state_->index->row(row);
-      if (screen_row == nullptr)
-        continue;
-      const LineRangeKey key{screen_row->buffer_start, screen_row->buffer_end};
-      auto range = candidates_by_range.equal_range(key);
-      if (range.first != range.second) {
-        reconciled[row] = range.first->second;
-        reconciled_ids.insert(range.first->second.id);
-        candidates_by_range.erase(range.first);
+    const uint64_t screen_row_count = state_->index->row_count();
+    const uint64_t local_start = update_diagnostics.replaced_screen_row_start;
+    const uint64_t local_count = update_diagnostics.replaced_screen_row_count;
+    if (incrementally_updated && update_diagnostics.updated_in_place &&
+        candidates.size() == screen_row_count && local_count > 0 &&
+        local_start <= screen_row_count &&
+        local_count <= screen_row_count - local_start) {
+      std::vector<DisplayViewState::LineIdentity> local_candidates(
+          candidates.begin() + static_cast<size_t>(local_start),
+          candidates.begin() + static_cast<size_t>(local_start + local_count));
+      std::unordered_multimap<LineRangeKey, DisplayViewState::LineIdentity,
+                              LineRangeKeyHash>
+          candidates_by_range;
+      for (const DisplayViewState::LineIdentity &identity : local_candidates) {
+        if (identity.initialized)
+          candidates_by_range.emplace(
+              LineRangeKey{identity.buffer_start, identity.buffer_end}, identity);
       }
+      std::vector<DisplayViewState::LineIdentity> reconciled(local_count);
+      std::unordered_set<uint64_t> reconciled_ids;
+      for (uint64_t offset = 0; offset < local_count; offset++) {
+        const ScreenRow *screen_row = state_->index->row(local_start + offset);
+        if (screen_row == nullptr)
+          continue;
+        const LineRangeKey key{screen_row->buffer_start, screen_row->buffer_end};
+        auto range = candidates_by_range.equal_range(key);
+        if (range.first != range.second) {
+          reconciled[offset] = range.first->second;
+          reconciled_ids.insert(range.first->second.id);
+          candidates_by_range.erase(range.first);
+        }
+      }
+      for (uint64_t offset = 0; offset < local_count; offset++) {
+        if (reconciled[offset].initialized)
+          continue;
+        const ScreenRow *screen_row = state_->index->row(local_start + offset);
+        const DisplayViewState::LineIdentity &candidate =
+            local_candidates[offset];
+        if (screen_row == nullptr || !candidate.initialized ||
+            reconciled_ids.contains(candidate.id) ||
+            candidate.buffer_start.row != candidate.buffer_end.row ||
+            candidate.buffer_start.row != screen_row->buffer_start.row ||
+            candidate.buffer_end.row != screen_row->buffer_end.row)
+          continue;
+        reconciled[offset] = candidate;
+        reconciled[offset].buffer_start = screen_row->buffer_start;
+        reconciled[offset].buffer_end = screen_row->buffer_end;
+        reconciled_ids.insert(candidate.id);
+      }
+      for (uint64_t offset = 0; offset < local_count; offset++)
+        candidates[local_start + offset] = std::move(reconciled[offset]);
+      state_->line_identities = std::move(candidates);
+    } else {
+      std::unordered_multimap<LineRangeKey, DisplayViewState::LineIdentity,
+                              LineRangeKeyHash>
+          candidates_by_range;
+      for (const DisplayViewState::LineIdentity &identity : candidates) {
+        if (identity.initialized)
+          candidates_by_range.emplace(
+              LineRangeKey{identity.buffer_start, identity.buffer_end}, identity);
+      }
+      std::vector<DisplayViewState::LineIdentity> reconciled(screen_row_count);
+      std::unordered_set<uint64_t> reconciled_ids;
+      for (uint64_t row = 0; row < screen_row_count; row++) {
+        const ScreenRow *screen_row = state_->index->row(row);
+        if (screen_row == nullptr)
+          continue;
+        const LineRangeKey key{screen_row->buffer_start, screen_row->buffer_end};
+        auto range = candidates_by_range.equal_range(key);
+        if (range.first != range.second) {
+          reconciled[row] = range.first->second;
+          reconciled_ids.insert(range.first->second.id);
+          candidates_by_range.erase(range.first);
+        }
+      }
+      // A same-row edit can move every later soft-wrap boundary by one column,
+      // so projected buffer ranges no longer match even when a rendered tail
+      // segment is byte-for-byte unchanged. Preserve an unmatched identity at
+      // the same screen-row index only within the same logical buffer row. The
+      // render fingerprint remains authoritative: build_render_plan assigns a
+      // fresh id before exposing any line whose text, tags, spans or wrap indent
+      // changed, so this fallback cannot reuse stale rendered content.
+      for (uint64_t row = 0; row < screen_row_count; row++) {
+        if (reconciled[row].initialized || row >= candidates.size())
+          continue;
+        const ScreenRow *screen_row = state_->index->row(row);
+        const DisplayViewState::LineIdentity &candidate = candidates[row];
+        if (screen_row == nullptr || !candidate.initialized ||
+            reconciled_ids.contains(candidate.id) ||
+            candidate.buffer_start.row != candidate.buffer_end.row ||
+            candidate.buffer_start.row != screen_row->buffer_start.row ||
+            candidate.buffer_end.row != screen_row->buffer_end.row)
+          continue;
+        reconciled[row] = candidate;
+        reconciled[row].buffer_start = screen_row->buffer_start;
+        reconciled[row].buffer_end = screen_row->buffer_end;
+        reconciled_ids.insert(candidate.id);
+      }
+      state_->line_identities = std::move(reconciled);
     }
-    // A same-row edit can move every later soft-wrap boundary by one column,
-    // so projected buffer ranges no longer match even when a rendered tail
-    // segment is byte-for-byte unchanged. Preserve an unmatched identity at
-    // the same screen-row index only within the same logical buffer row. The
-    // render fingerprint remains authoritative: build_render_plan assigns a
-    // fresh id before exposing any line whose text, tags, spans or wrap indent
-    // changed, so this fallback cannot reuse stale rendered content.
-    for (uint64_t row = 0; row < state_->index->row_count(); row++) {
-      if (reconciled[row].initialized || row >= candidates.size())
-        continue;
-      const ScreenRow *screen_row = state_->index->row(row);
-      const DisplayViewState::LineIdentity &candidate = candidates[row];
-      if (screen_row == nullptr || !candidate.initialized ||
-          reconciled_ids.contains(candidate.id) ||
-          candidate.buffer_start.row != candidate.buffer_end.row ||
-          candidate.buffer_start.row != screen_row->buffer_start.row ||
-          candidate.buffer_end.row != screen_row->buffer_end.row)
-        continue;
-      reconciled[row] = candidate;
-      reconciled[row].buffer_start = screen_row->buffer_start;
-      reconciled[row].buffer_end = screen_row->buffer_end;
-      reconciled_ids.insert(candidate.id);
-    }
-    state_->line_identities = std::move(reconciled);
     state_->cached_buffer_revision = revision;
     state_->cached_fold_generation = state_->fold_generation;
     state_->index_initialized = true;
@@ -836,6 +889,8 @@ bool DisplayViewWrapper::ensure_index(
             .count();
     if (incrementally_updated) {
       state_->index_incremental_update_count++;
+      if (update_diagnostics.updated_in_place)
+        state_->index_in_place_update_count++;
       state_->index_incremental_update_milliseconds += elapsed;
       state_->index_incremental_rows_rebuilt +=
           update_diagnostics.screen_rows_rebuilt;
@@ -1474,6 +1529,8 @@ Napi::Value DisplayViewWrapper::get_diagnostics(
   result.Set("indexIncrementalUpdateCount",
              Napi::Number::New(env,
                                state_->index_incremental_update_count));
+  result.Set("indexInPlaceUpdateCount",
+             Napi::Number::New(env, state_->index_in_place_update_count));
   result.Set("indexIncrementalFallbackCount",
              Napi::Number::New(env,
                                state_->index_incremental_fallback_count));

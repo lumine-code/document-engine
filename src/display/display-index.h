@@ -54,6 +54,9 @@ struct ScreenRow {
   uint32_t leading_indent = 0;
   int64_t soft_wrap_indent = -1;
   bool starts_in_leading_whitespace = true;
+  // True when wrapping this row can restart without hidden preferred-boundary
+  // state carried from the preceding screen row.
+  bool is_layout_checkpoint = true;
   bool wraps_to_next = false;
   Point wrap_boundary;
   Point wrap_predecessor;
@@ -78,6 +81,9 @@ struct DisplayIndexUpdateDiagnostics {
   uint64_t screen_rows_rebuilt = 0;
   uint64_t screen_rows_reused = 0;
   uint64_t layout_units_scanned = 0;
+  uint64_t replaced_screen_row_start = 0;
+  uint64_t replaced_screen_row_count = 0;
+  bool updated_in_place = false;
 };
 
 class DisplayIndex {
@@ -170,6 +176,7 @@ private:
                          const LogicalLine &line, UnitCursor start,
                          UnitCursor end, uint32_t leading_indent,
                          bool starts_in_leading_whitespace,
+                         bool is_layout_checkpoint,
                          bool wraps_to_next, uint32_t next_indent,
                          uint64_t known_visual_width);
 

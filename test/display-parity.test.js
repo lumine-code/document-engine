@@ -242,6 +242,42 @@ test(
 )
 
 test(
+  'matches legacy layout width when a word-boundary wrap carries a tab',
+  {
+    skip: !hasLegacyOracle,
+  },
+  async () => {
+    for (const {text, lines} of [
+      {text: 'a bbbbbb\t x', lines: ['a ', 'bbbbbb       x']},
+      {text: 'abc def\t def ', lines: ['abc ', 'def    ', 'def ']},
+    ]) {
+      const pair = await buildPair({
+        text,
+        options: {
+          ...parityOptions,
+          wrapColumn: 12,
+          tabLength: 6,
+          softWrapHangingIndent: 0,
+          wrapBoundaryMode: 'word',
+        },
+      })
+      try {
+        assert.deepEqual(
+          pair.legacy
+            .getScreenLines(0, pair.legacy.getScreenLineCount())
+            .map((line) => line.lineText),
+          lines,
+        )
+        compareLines(pair)
+        compareMappings(pair)
+      } finally {
+        await pair.destroy()
+      }
+    }
+  },
+)
+
+test(
   'matches legacy same-row, cross-row, adjacent and overlapping folds',
   {
     skip: !hasLegacyOracle,

@@ -346,12 +346,14 @@ void DisplayIndex::append_screen_row(const SnapshotReader &reader,
                                      UnitCursor start, UnitCursor end,
                                      uint32_t leading_indent,
                                      bool starts_in_leading_whitespace,
+                                     bool is_layout_checkpoint,
                                      bool wraps_to_next,
                                      uint32_t next_indent,
                                      uint64_t known_visual_width) {
   ScreenRow row;
   row.leading_indent = leading_indent;
   row.starts_in_leading_whitespace = starts_in_leading_whitespace;
+  row.is_layout_checkpoint = is_layout_checkpoint;
   row.visual_width = leading_indent;
   row.buffer_start = line.start;
   row.buffer_end = line.end;
@@ -462,12 +464,14 @@ void DisplayIndex::wrap_logical_line_from(
   const UnitCursor logical_end = end_cursor(line);
   if (same_cursor(logical_start, logical_end)) {
     append_screen_row(reader, line, logical_start, logical_end, leading_indent,
-                      starts_in_leading_whitespace, false, 0, leading_indent);
+                      starts_in_leading_whitespace, true, false, 0,
+                      leading_indent);
     return;
   }
   if (options_.wrap_column == 0) {
     append_screen_row(reader, line, logical_start, logical_end, leading_indent,
-                      starts_in_leading_whitespace, false, 0, UINT64_MAX);
+                      starts_in_leading_whitespace, true, false, 0,
+                      UINT64_MAX);
     return;
   }
 
@@ -475,11 +479,13 @@ void DisplayIndex::wrap_logical_line_from(
   UnitCursor cursor = logical_start;
   UnitCursor last_boundary{};
   uint64_t last_boundary_screen_column = 0;
+  double last_boundary_line_width = 0;
   bool has_boundary = false;
   bool saw_non_whitespace = !starts_in_leading_whitespace;
   int64_t first_non_whitespace_screen_column = -1;
   bool builder_in_leading_whitespace = starts_in_leading_whitespace;
   bool row_starts_in_leading_whitespace = starts_in_leading_whitespace;
+  bool row_is_layout_checkpoint = true;
   uint64_t screen_column = leading_indent;
   double line_width =
       leading_indent * ratio_for_character(static_cast<char16_t>(u' '));
@@ -489,7 +495,6 @@ void DisplayIndex::wrap_logical_line_from(
     DisplayUnit unit;
     if (!next_unit(reader, line, cursor, unit))
       break;
-
     if (!saw_non_whitespace) {
       saw_non_whitespace = unit.character != u' ' && unit.character != u'\t';
       if (saw_non_whitespace)
@@ -500,6 +505,7 @@ void DisplayIndex::wrap_logical_line_from(
       if (!same_cursor(before, row_start)) {
         last_boundary = before;
         last_boundary_screen_column = screen_column;
+        last_boundary_line_width = line_width;
         has_boundary = true;
       }
     }
@@ -521,8 +527,11 @@ void DisplayIndex::wrap_logical_line_from(
       if (!same_cursor(split, row_start)) {
         const uint64_t split_screen_column =
             has_boundary ? last_boundary_screen_column : screen_column;
+        const double split_line_width =
+            has_boundary ? last_boundary_line_width : line_width;
         append_screen_row(reader, line, row_start, split, leading_indent,
-                          row_starts_in_leading_whitespace, true, next_indent,
+                          row_starts_in_leading_whitespace,
+                          row_is_layout_checkpoint, true, next_indent,
                           split_screen_column);
         row_start = split;
         row_starts_in_leading_whitespace =
@@ -530,13 +539,14 @@ void DisplayIndex::wrap_logical_line_from(
         leading_indent = next_indent;
         screen_column = leading_indent;
         line_width =
-            leading_indent * ratio_for_character(static_cast<char16_t>(u' '));
+            leading_indent * ratio_for_character(static_cast<char16_t>(u' ')) +
+            (line_width - split_line_width);
+        row_is_layout_checkpoint = !has_boundary;
 
         UnitCursor carried = row_start;
         DisplayUnit carried_unit;
         while (!same_cursor(carried, before) &&
                next_unit(reader, line, carried, carried_unit)) {
-          line_width += layout_width(carried_unit, screen_column);
           screen_column += screen_width(carried_unit, screen_column);
         }
         has_boundary = false;
@@ -553,7 +563,8 @@ void DisplayIndex::wrap_logical_line_from(
   }
 
   append_screen_row(reader, line, row_start, logical_end, leading_indent,
-                    row_starts_in_leading_whitespace, false, 0,
+                    row_starts_in_leading_whitespace,
+                    row_is_layout_checkpoint, false, 0,
                     screen_column);
 }
 
@@ -699,6 +710,12 @@ bool DisplayIndex::update(
   size_t rebuild_start = static_cast<size_t>(candidate);
   if (rebuild_start > line_begin)
     rebuild_start--;
+  // A preferred-boundary wrap can carry already-measured units into the next
+  // screen row. Rewind past those rows until wrapping has a complete state;
+  // hard-wrap rows remain cheap suffix checkpoints for minified long lines.
+  while (rebuild_start > line_begin &&
+         !rows_[rebuild_start].is_layout_checkpoint)
+    rebuild_start--;
   if (rows_[rebuild_start].starts_in_leading_whitespace)
     rebuild_start = line_begin;
   // Reflowing from the beginning of the only logical line cannot reuse any
@@ -739,6 +756,51 @@ bool DisplayIndex::update(
   if (replacement.rows_.empty() ||
       replacement.rows_.front().buffer_start != rebuild_point)
     return false;
+
+  const size_t replaced_row_count = line_end - rebuild_start;
+  if (old_line_length == new_line_length &&
+      replacement.rows_.size() == replaced_row_count &&
+      leading_whitespace_ends_.size() == analysis->line_starts.size() &&
+      trailing_whitespace_starts_.size() == analysis->line_starts.size()) {
+    const uint64_t line_start = analysis->line_starts[buffer_row];
+    const uint64_t line_finish = analysis->line_ends[buffer_row];
+    uint64_t leading_offset = line_start;
+    while (leading_offset < line_finish) {
+      const char16_t character = reader.character_at(leading_offset);
+      if (character != u' ' && character != u'\t')
+        break;
+      leading_offset++;
+    }
+    uint64_t trailing_offset = line_finish;
+    while (trailing_offset > line_start) {
+      const char16_t character = reader.character_at(trailing_offset - 1);
+      if (character != u' ' && character != u'\t')
+        break;
+      trailing_offset--;
+    }
+    if (!reader.valid())
+      return false;
+
+    for (size_t index = 0; index < replaced_row_count; index++)
+      rows_[rebuild_start + index] = std::move(replacement.rows_[index]);
+    analysis_ = std::move(analysis);
+    folds_.clear();
+    leading_whitespace_ends_[buffer_row] = leading_offset - line_start;
+    trailing_whitespace_starts_[buffer_row] = trailing_offset - line_start;
+    layout_units_scanned_ = replacement.layout_units_scanned_;
+    peak_logical_segments_ = std::max<uint64_t>(1, peak_logical_segments_);
+    peak_row_spans_ =
+        std::max<uint64_t>(replacement.peak_row_spans_, peak_row_spans_);
+    if (diagnostics != nullptr) {
+      diagnostics->screen_rows_rebuilt = replaced_row_count;
+      diagnostics->screen_rows_reused = rows_.size() - replaced_row_count;
+      diagnostics->layout_units_scanned = layout_units_scanned_;
+      diagnostics->replaced_screen_row_start = rebuild_start;
+      diagnostics->replaced_screen_row_count = replaced_row_count;
+      diagnostics->updated_in_place = true;
+    }
+    return true;
+  }
 
   std::vector<ScreenRow> updated_rows;
   updated_rows.reserve(rebuild_start + replacement.rows_.size() +
@@ -1187,7 +1249,8 @@ DisplayIndexDiagnostics DisplayIndex::diagnostics() const {
                           rows_.capacity() * sizeof(ScreenRow) +
                           folds_.capacity() * sizeof(Fold) +
                           leading_whitespace_ends_.capacity() * sizeof(uint64_t) +
-                          trailing_whitespace_starts_.capacity() * sizeof(uint64_t) +
+                          trailing_whitespace_starts_.capacity() *
+                              sizeof(uint64_t) +
                           options_.fold_character.capacity() * sizeof(char16_t);
   for (const ScreenRow &row : rows_) {
     result.display_span_count += row.spans.size();

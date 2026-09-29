@@ -46,6 +46,7 @@ struct DisplayViewState {
   uint64_t fold_reset_count = 0;
   uint64_t index_rebuild_count = 0;
   uint64_t index_incremental_update_count = 0;
+  uint64_t index_in_place_update_count = 0;
   uint64_t index_incremental_fallback_count = 0;
   uint64_t index_incremental_rows_rebuilt = 0;
   uint64_t index_incremental_rows_reused = 0;
