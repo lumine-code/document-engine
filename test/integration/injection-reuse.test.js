@@ -19,6 +19,10 @@ const javascriptInjections = grammarPath(
   'language-javascript',
   'javascript-injections.scm',
 )
+const javascriptHighlights = grammarPath(
+  'language-javascript',
+  'javascript-highlights.scm',
+)
 const regexWasm = grammarPath('language-regex', 'regex.wasm')
 const regexHighlights = grammarPath('language-regex', 'regex-highlights.scm')
 const htmlWasm = grammarPath('language-html', 'html.wasm')
@@ -165,8 +169,46 @@ function queryFixture(text) {
   return {session, buffer, bridge}
 }
 
+function htmlQueryFixture(text) {
+  const session = new DocumentSession()
+  const root = new FakeGrammar(
+    'text.html.basic',
+    descriptor('text.html.basic', htmlWasm, 'html'),
+  )
+  const javascript = new FakeGrammar(
+    'source.js',
+    descriptor('source.js', javascriptWasm, 'javascript', {
+      highlightsQuery: [javascriptHighlights],
+    }),
+    ['javascript', 'js'],
+  )
+  const buffer = new TextBuffer(text)
+  session.configureSyntax({
+    languageId: 'text.html.basic',
+    wasmPath: htmlWasm,
+    languageName: 'html',
+    queries: {
+      injectionsQuery: String.raw`
+        (script_element
+          (raw_text) @injection.content
+          (#set! injection.language "javascript")
+          (#set! injection.combined))
+      `,
+    },
+  })
+  const bridge = createBridge(
+    session,
+    buffer,
+    root,
+    new Map([['javascript', javascript]]),
+  )
+  return {session, buffer, bridge}
+}
+
 test('reuses query child backends while public layer identities stay revision-scoped', async () => {
-  const fixture = queryFixture('const marker = 0;\nconst first = /a+/;\n')
+  const fixture = htmlQueryFixture(
+    '<div data-marker="0"></div>\n<script>const first = 1;</script>\n',
+  )
   const {session, buffer, bridge} = fixture
   await apply(session, buffer, 1)
   const initial = await bridge.synchronize()
@@ -175,44 +217,77 @@ test('reuses query child backends while public layer identities stay revision-sc
   assert.equal(initialDiagnostics.parsedInjectionLayerCount, 1)
   assert.equal(initialDiagnostics.injectionChildBackendCount, 1)
   const initialQuery = queryHighlights(session)
-  const initialRegex = unpack(initialQuery).find(
-    (capture) => capture.grammarId === 'source.regexp',
+  const initialJavascript = unpack(initialQuery).find(
+    (capture) => capture.grammarId === 'source.js',
   )
-  assert.ok(initialRegex)
+  assert.ok(initialJavascript)
 
+  const markerIndex = buffer.getText().indexOf('0')
+  const marker = buffer.positionForCharacterIndex(markerIndex)
   buffer.setTextInRange(
-    {start: {row: 0, column: 15}, end: {row: 0, column: 16}},
+    {start: marker, end: {row: marker.row, column: marker.column + 1}},
     '1',
   )
-  await apply(session, buffer, 2, new Uint32Array([0, 15, 0, 16, 0, 15, 0, 16]))
+  await apply(
+    session,
+    buffer,
+    2,
+    new Uint32Array([
+      marker.row,
+      marker.column,
+      marker.row,
+      marker.column + 1,
+      marker.row,
+      marker.column,
+      marker.row,
+      marker.column + 1,
+    ]),
+  )
   const outside = await bridge.synchronize()
   assert.equal(outside.reusedLayers, 1)
   assert.equal(outside.projectedRanges, 1)
   assert.equal(outside.childIncrementalParses, 1)
   assert.equal(outside.childFullParses, 0)
   const outsideQuery = queryHighlights(session)
-  const outsideRegex = unpack(outsideQuery).find(
-    (capture) => capture.grammarId === 'source.regexp',
+  const outsideJavascript = unpack(outsideQuery).find(
+    (capture) => capture.grammarId === 'source.js',
   )
-  assert.ok(outsideRegex)
-  assert.notEqual(outsideRegex.layerId, initialRegex.layerId)
+  assert.ok(outsideJavascript)
+  assert.notEqual(outsideJavascript.layerId, initialJavascript.layerId)
   assert.throws(
     () =>
       session.resolveQueryNode(
         {
-          layerId: initialRegex.layerId,
-          nodeHandle: initialRegex.nodeHandle,
+          layerId: initialJavascript.layerId,
+          nodeHandle: initialJavascript.nodeHandle,
         },
         revisionTags(session),
       ),
     (error) => error.code === 'ERR_STALE_INJECTION_NODE',
   )
 
+  const childIndex =
+    buffer.getText().indexOf('const first = 1') + 'const first = '.length
+  const child = buffer.positionForCharacterIndex(childIndex)
   buffer.setTextInRange(
-    {start: {row: 1, column: 15}, end: {row: 1, column: 16}},
-    'c',
+    {start: child, end: {row: child.row, column: child.column + 1}},
+    '2',
   )
-  await apply(session, buffer, 3, new Uint32Array([1, 15, 1, 16, 1, 15, 1, 16]))
+  await apply(
+    session,
+    buffer,
+    3,
+    new Uint32Array([
+      child.row,
+      child.column,
+      child.row,
+      child.column + 1,
+      child.row,
+      child.column,
+      child.row,
+      child.column + 1,
+    ]),
+  )
   const inside = await bridge.synchronize()
   assert.equal(inside.reusedLayers, 1)
   assert.equal(inside.childIncrementalParses, 1)
@@ -229,7 +304,7 @@ test('reuses query child backends while public layer identities stay revision-sc
   assert.equal(shifted.childIncrementalParses, 1)
   assert.equal(shifted.childFullParses, 0)
 
-  const oracle = queryFixture(buffer.getText())
+  const oracle = htmlQueryFixture(buffer.getText())
   await apply(oracle.session, oracle.buffer, 1)
   await oracle.bridge.synchronize()
   assert.deepEqual(
