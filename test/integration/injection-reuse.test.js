@@ -172,7 +172,10 @@ test('reuses query child backends while public layer identities stay revision-sc
   const {session, buffer, bridge} = fixture
   await apply(session, buffer, 1)
   const initial = await bridge.synchronize()
-  assert.equal(initial.childFullParses, 1)
+  assert.equal(initial.accepted, true)
+  const initialDiagnostics = session.getDiagnostics()
+  assert.equal(initialDiagnostics.parsedInjectionLayerCount, 1)
+  assert.equal(initialDiagnostics.injectionChildBackendCount, 1)
   const initialQuery = queryHighlights(session)
   const initialRegex = unpack(initialQuery).find(
     (capture) => capture.grammarId === 'source.regexp',
