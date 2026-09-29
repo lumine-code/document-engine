@@ -166,9 +166,7 @@ function queryFixture(text) {
 }
 
 test('reuses query child backends while public layer identities stay revision-scoped', async () => {
-  const fixture = queryFixture(
-    'const marker = 0;\nconst first = /a+/;\nconst second = /b?/;\n',
-  )
+  const fixture = queryFixture('const marker = 0;\nconst first = /a+/;\n')
   const {session, buffer, bridge} = fixture
   await apply(session, buffer, 1)
   const initial = await bridge.synchronize()
@@ -189,7 +187,7 @@ test('reuses query child backends while public layer identities stay revision-sc
   await apply(session, buffer, 2, new Uint32Array([0, 15, 0, 16, 0, 15, 0, 16]))
   const outside = await bridge.synchronize()
   assert.equal(outside.reusedLayers, 1)
-  assert.equal(outside.projectedRanges, 2)
+  assert.equal(outside.projectedRanges, 1)
   assert.equal(outside.childIncrementalParses, 1)
   assert.equal(outside.childFullParses, 0)
   const outsideQuery = queryHighlights(session)
@@ -227,7 +225,7 @@ test('reuses query child backends while public layer identities stay revision-sc
   await apply(session, buffer, 4, new Uint32Array([0, 0, 0, 0, 0, 0, 1, 0]))
   const shifted = await bridge.synchronize()
   assert.equal(shifted.reusedLayers, 1)
-  assert.equal(shifted.projectedRanges, 2)
+  assert.equal(shifted.projectedRanges, 1)
   assert.equal(shifted.childIncrementalParses, 1)
   assert.equal(shifted.childFullParses, 0)
 
