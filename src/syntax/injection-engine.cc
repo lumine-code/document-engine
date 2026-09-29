@@ -508,6 +508,8 @@ struct InjectionEngine::Impl {
   uint64_t projected_range_count = 0;
   uint64_t child_incremental_parse_count = 0;
   uint64_t child_full_parse_count = 0;
+  uint64_t child_tree_edit_reuse_count = 0;
+  uint64_t child_tree_edit_fallback_count = 0;
   uint64_t reuse_fallback_count = 0;
   // Keep the last finalized layer count across publish_root's query-only
   // staging index so the bridge can distinguish stable zero from a removal.
@@ -1334,10 +1336,14 @@ public:
       layer.syntax = std::move(result.published_snapshot);
       layer.queries = std::move(result.query_snapshot);
       if (result.parsed) {
-        if (result.incremental)
+        if (result.parse_skipped)
+          child_tree_edit_reuses_++;
+        else if (result.incremental)
           child_incremental_parses_++;
         else
           child_full_parses_++;
+        if (result.tree_projection_fallback)
+          child_tree_edit_fallbacks_++;
       }
     }
     finalize_index_counts(*index_);
@@ -1381,6 +1387,9 @@ public:
     engine_->impl_->child_incremental_parse_count +=
         child_incremental_parses_;
     engine_->impl_->child_full_parse_count += child_full_parses_;
+    engine_->impl_->child_tree_edit_reuse_count += child_tree_edit_reuses_;
+    engine_->impl_->child_tree_edit_fallback_count +=
+        child_tree_edit_fallbacks_;
     const std::set<InjectionSourceToken> available_tokens =
         available_source_tokens(engine_->impl_->root_syntax,
                                 engine_->impl_->root_grammar_id, *index_,
@@ -1424,6 +1433,10 @@ public:
                  Napi::Number::New(env, child_incremental_parses_));
     response.Set("childFullParses",
                  Napi::Number::New(env, child_full_parses_));
+    response.Set("childTreeEditReuses",
+                 Napi::Number::New(env, child_tree_edit_reuses_));
+    response.Set("childTreeEditFallbacks",
+                 Napi::Number::New(env, child_tree_edit_fallbacks_));
     response.Set("reuseFallback", Napi::Boolean::New(env, reuse_fallback));
     response.Set("rescanRequired",
                  Napi::Boolean::New(env, rescan_required));
@@ -1470,6 +1483,8 @@ private:
   uint64_t projected_ranges_ = 0;
   uint64_t child_incremental_parses_ = 0;
   uint64_t child_full_parses_ = 0;
+  uint64_t child_tree_edit_reuses_ = 0;
+  uint64_t child_tree_edit_fallbacks_ = 0;
   bool reuse_fallback_ = false;
   uint64_t maximum_utf16_length_ = MAX_SYNTAX_UTF16_LENGTH;
   bool cancelled_ = false;
@@ -1595,6 +1610,9 @@ InjectionEngineDiagnostics InjectionEngine::diagnostics() const {
   result.child_incremental_parse_count =
       impl_->child_incremental_parse_count;
   result.child_full_parse_count = impl_->child_full_parse_count;
+  result.child_tree_edit_reuse_count = impl_->child_tree_edit_reuse_count;
+  result.child_tree_edit_fallback_count =
+      impl_->child_tree_edit_fallback_count;
   result.reuse_fallback_count = impl_->reuse_fallback_count;
   result.child_backend_count = impl_->child_backends.size();
   result.query_language_resolution_count =
@@ -1772,6 +1790,8 @@ Napi::Value InjectionEngine::queue_child_parse(
                  Napi::Number::New(env, reconciliation.projected_ranges));
     response.Set("childIncrementalParses", Napi::Number::New(env, 0));
     response.Set("childFullParses", Napi::Number::New(env, 0));
+    response.Set("childTreeEditReuses", Napi::Number::New(env, 0));
+    response.Set("childTreeEditFallbacks", Napi::Number::New(env, 0));
     response.Set("reuseFallback",
                  Napi::Boolean::New(env, reuse_fallback));
     response.Set("rescanRequired",

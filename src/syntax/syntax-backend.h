@@ -109,6 +109,9 @@ struct SyntaxParseResult {
   bool attempted = false;
   bool parsed = false;
   bool incremental = false;
+  bool parse_skipped = false;
+  bool tree_projected = false;
+  bool tree_projection_fallback = false;
   bool cancelled = false;
   bool grammar_cache_hit = false;
   bool root_has_error = false;

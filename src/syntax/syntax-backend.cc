@@ -524,6 +524,38 @@ bool included_ranges_match_after_edit(
   return true;
 }
 
+bool included_range_columns_unchanged(
+    const std::vector<SyntaxConfiguration::IncludedRange> &previous,
+    const std::vector<SyntaxConfiguration::IncludedRange> &current) {
+  if (previous.size() != current.size())
+    return false;
+  for (size_t index = 0; index < previous.size(); index++) {
+    if (previous[index].start.column != current[index].start.column ||
+        previous[index].end.column != current[index].end.column)
+      return false;
+  }
+  return true;
+}
+
+bool tree_included_ranges_equal(const TSTree *tree,
+                                const std::vector<TSRange> &expected) {
+  uint32_t count = 0;
+  TSRange *actual = ts_tree_included_ranges(tree, &count);
+  const bool same_count = count == expected.size();
+  bool equal = same_count;
+  for (uint32_t index = 0; equal && index < count; index++) {
+    equal = actual[index].start_byte == expected[index].start_byte &&
+            actual[index].end_byte == expected[index].end_byte &&
+            actual[index].start_point.row == expected[index].start_point.row &&
+            actual[index].start_point.column ==
+                expected[index].start_point.column &&
+            actual[index].end_point.row == expected[index].end_point.row &&
+            actual[index].end_point.column == expected[index].end_point.column;
+  }
+  std::free(actual);
+  return equal;
+}
+
 bool build_included_ranges(
     const std::vector<SyntaxConfiguration::IncludedRange> &source,
     std::vector<TSRange> &output) {
@@ -663,14 +695,42 @@ bool SyntaxBackend::parse(
       same_included_ranges(runtime.included_ranges,
                            configuration.included_ranges);
   const bool included_ranges_projected =
-      !included_ranges_unchanged && edits.size() == 1 &&
-      runtime.tree_analysis != nullptr &&
+      edits.size() == 1 && runtime.tree_analysis != nullptr &&
       included_ranges_match_after_edit(
           runtime.included_ranges, configuration.included_ranges,
           edits.front(), *runtime.tree_analysis, *analysis);
 
+  TSInputEdit input_edit{};
+  const bool has_input_edit =
+      edits.size() == 1 && runtime.tree_analysis != nullptr &&
+      build_input_edit(edits.front(), *runtime.tree_analysis, *analysis,
+                       input_edit);
+  const bool tree_projection_candidate =
+      !configuration.included_ranges.empty() && included_ranges_projected &&
+      runtime.tree != nullptr && runtime.tree_revision + 1 == revision &&
+      has_input_edit;
+  TSTree *projected_tree = nullptr;
+  bool can_project_injected_tree = false;
+  if (tree_projection_candidate &&
+      included_range_columns_unchanged(runtime.included_ranges,
+                                       configuration.included_ranges)) {
+    projected_tree = ts_tree_copy(runtime.tree);
+    ts_tree_edit(projected_tree, &input_edit);
+    can_project_injected_tree =
+        tree_included_ranges_equal(projected_tree, included_ranges);
+    if (!can_project_injected_tree) {
+      ts_tree_delete(projected_tree);
+      projected_tree = nullptr;
+    }
+  }
+  result.tree_projection_fallback =
+      !configuration.included_ranges.empty() && edits.size() == 1 &&
+      runtime.tree != nullptr && runtime.tree_revision + 1 == revision &&
+      has_input_edit && !can_project_injected_tree;
+
   TSTree *old_tree = nullptr;
-  if ((included_ranges_unchanged || included_ranges_projected) &&
+  if (!can_project_injected_tree &&
+      (included_ranges_unchanged || included_ranges_projected) &&
       runtime.tree != nullptr &&
       runtime.tree_revision + 1 == revision &&
       runtime.tree_analysis != nullptr) {
@@ -679,14 +739,10 @@ bool SyntaxBackend::parse(
         runtime.tree_analysis->checksum == analysis->checksum) {
       old_tree = ts_tree_copy(runtime.tree);
       result.incremental = true;
-    } else if (edits.size() == 1) {
-      TSInputEdit input_edit{};
-      if (build_input_edit(edits.front(), *runtime.tree_analysis, *analysis,
-                           input_edit)) {
-        old_tree = ts_tree_copy(runtime.tree);
-        ts_tree_edit(old_tree, &input_edit);
-        result.incremental = true;
-      }
+    } else if (has_input_edit) {
+      old_tree = ts_tree_copy(runtime.tree);
+      ts_tree_edit(old_tree, &input_edit);
+      result.incremental = true;
     }
   }
 
@@ -695,8 +751,16 @@ bool SyntaxBackend::parse(
   TSParseOptions options{const_cast<SyntaxCancellation *>(&cancellation),
                          cancel_parse};
   const auto started_at = Clock::now();
-  TSTree *new_tree =
-      ts_parser_parse_with_options(runtime.parser, old_tree, input, options);
+  TSTree *new_tree = nullptr;
+  if (can_project_injected_tree) {
+    new_tree = projected_tree;
+    result.incremental = true;
+    result.parse_skipped = true;
+    result.tree_projected = true;
+  } else {
+    new_tree =
+        ts_parser_parse_with_options(runtime.parser, old_tree, input, options);
+  }
   result.parse_milliseconds =
       std::chrono::duration<double, std::milli>(Clock::now() - started_at)
           .count();

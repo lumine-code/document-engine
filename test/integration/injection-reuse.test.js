@@ -246,8 +246,10 @@ test('reuses query child backends while public layer identities stay revision-sc
   const outside = await bridge.synchronize()
   assert.equal(outside.reusedLayers, 1)
   assert.equal(outside.projectedRanges, 1)
-  assert.equal(outside.childIncrementalParses, 1)
+  assert.equal(outside.childIncrementalParses, 0)
   assert.equal(outside.childFullParses, 0)
+  assert.equal(outside.childTreeEditReuses, 1)
+  assert.equal(outside.childTreeEditFallbacks, 0)
   const outsideQuery = queryHighlights(session)
   const outsideJavascript = unpack(outsideQuery).find(
     (capture) => capture.grammarId === 'source.js',
@@ -292,6 +294,8 @@ test('reuses query child backends while public layer identities stay revision-sc
   assert.equal(inside.reusedLayers, 1)
   assert.equal(inside.childIncrementalParses, 1)
   assert.equal(inside.childFullParses, 0)
+  assert.equal(inside.childTreeEditReuses, 0)
+  assert.equal(inside.childTreeEditFallbacks, 1)
 
   buffer.setTextInRange(
     {start: {row: 0, column: 0}, end: {row: 0, column: 0}},
@@ -301,8 +305,137 @@ test('reuses query child backends while public layer identities stay revision-sc
   const shifted = await bridge.synchronize()
   assert.equal(shifted.reusedLayers, 1)
   assert.equal(shifted.projectedRanges, 1)
-  assert.equal(shifted.childIncrementalParses, 1)
+  assert.equal(shifted.childIncrementalParses, 0)
   assert.equal(shifted.childFullParses, 0)
+  assert.equal(shifted.childTreeEditReuses, 1)
+  assert.equal(shifted.childTreeEditFallbacks, 0)
+
+  buffer.setTextInRange(
+    {start: {row: 2, column: 0}, end: {row: 2, column: 0}},
+    ' ',
+  )
+  await apply(session, buffer, 5, new Uint32Array([2, 0, 2, 0, 2, 0, 2, 1]))
+  const sameLineShift = await bridge.synchronize()
+  assert.equal(sameLineShift.reusedLayers, 1)
+  assert.equal(sameLineShift.childTreeEditReuses, 0)
+  assert.equal(sameLineShift.childTreeEditFallbacks, 1)
+  assert.equal(sameLineShift.childIncrementalParses, 1)
+
+  const end = buffer.positionForCharacterIndex(buffer.getText().length)
+  buffer.setTextInRange({start: end, end}, '\n<!-- tail -->')
+  await apply(
+    session,
+    buffer,
+    6,
+    new Uint32Array([
+      end.row,
+      end.column,
+      end.row,
+      end.column,
+      end.row,
+      end.column,
+      end.row + 1,
+      13,
+    ]),
+  )
+  const afterRanges = await bridge.synchronize()
+  assert.equal(afterRanges.childTreeEditReuses, 1)
+  assert.equal(afterRanges.childTreeEditFallbacks, 0)
+  assert.equal(afterRanges.childIncrementalParses, 0)
+
+  const oracle = htmlQueryFixture(buffer.getText())
+  await apply(oracle.session, oracle.buffer, 1)
+  await oracle.bridge.synchronize()
+  assert.deepEqual(
+    semanticCaptures(queryHighlights(session)),
+    semanticCaptures(queryHighlights(oracle.session)),
+  )
+
+  oracle.bridge.destroy()
+  await oracle.session.destroy()
+  bridge.destroy()
+  await session.destroy()
+})
+
+test('keeps projected child trees bounded across repeated outside edits before parsing an inside edit', async () => {
+  const fixture = htmlQueryFixture(
+    '<div data-marker="0"></div>\n<script>const value = 1;</script>\n',
+  )
+  const {session, buffer, bridge} = fixture
+  await apply(session, buffer, 1)
+  await bridge.synchronize()
+
+  let revision = 1
+  for (let iteration = 0; iteration < 20; iteration++) {
+    const current = iteration % 2 === 0 ? '0' : '1'
+    const markerIndex =
+      buffer.getText().indexOf(`marker="${current}`) + 'marker="'.length
+    const marker = buffer.positionForCharacterIndex(markerIndex)
+    const replacement = current === '0' ? '1' : '0'
+    buffer.setTextInRange(
+      {start: marker, end: {row: marker.row, column: marker.column + 1}},
+      replacement,
+    )
+    await apply(
+      session,
+      buffer,
+      ++revision,
+      new Uint32Array([
+        marker.row,
+        marker.column,
+        marker.row,
+        marker.column + 1,
+        marker.row,
+        marker.column,
+        marker.row,
+        marker.column + 1,
+      ]),
+    )
+    const outside = await bridge.synchronize()
+    assert.equal(outside.childTreeEditReuses, 1)
+    assert.equal(outside.childIncrementalParses, 0)
+    assert.equal(outside.childFullParses, 0)
+  }
+
+  buffer.setTextInRange(
+    {start: {row: 0, column: 0}, end: {row: 0, column: 0}},
+    '\n',
+  )
+  await apply(
+    session,
+    buffer,
+    revision + 1,
+    new Uint32Array([0, 0, 0, 0, 0, 0, 1, 0]),
+  )
+  const prefix = await bridge.synchronize()
+  assert.equal(prefix.childTreeEditReuses, 1)
+  assert.equal(prefix.childIncrementalParses, 0)
+
+  const valueIndex = buffer.getText().indexOf('1;</script>')
+  const value = buffer.positionForCharacterIndex(valueIndex)
+  buffer.setTextInRange(
+    {start: value, end: {row: value.row, column: value.column + 1}},
+    '2',
+  )
+  await apply(
+    session,
+    buffer,
+    revision + 2,
+    new Uint32Array([
+      value.row,
+      value.column,
+      value.row,
+      value.column + 1,
+      value.row,
+      value.column,
+      value.row,
+      value.column + 1,
+    ]),
+  )
+  const inside = await bridge.synchronize()
+  assert.equal(inside.childTreeEditReuses, 0)
+  assert.equal(inside.childTreeEditFallbacks, 1)
+  assert.equal(inside.childIncrementalParses, 1)
 
   const oracle = htmlQueryFixture(buffer.getText())
   await apply(oracle.session, oracle.buffer, 1)
@@ -356,8 +489,10 @@ test('reuses unaffected dynamic siblings and prunes retired child backends', asy
   await apply(session, buffer, 2, new Uint32Array([0, 22, 0, 23, 0, 22, 0, 25]))
   const changed = await bridge.synchronize()
   assert.equal(changed.reusedLayers, 1)
-  assert.equal(changed.childIncrementalParses, 1)
+  assert.equal(changed.childIncrementalParses, 0)
   assert.equal(changed.childFullParses, 1)
+  assert.equal(changed.childTreeEditReuses, 1)
+  assert.equal(changed.childTreeEditFallbacks, 0)
   assert.equal(changed.reuseFallback, true)
   assert.equal(session.getDiagnostics().injectionChildBackendCount, 2)
 
@@ -388,8 +523,10 @@ test('reuses unaffected dynamic siblings and prunes retired child backends', asy
     )
     const reused = await bridge.synchronize()
     assert.equal(reused.reusedLayers, 2)
-    assert.equal(reused.childIncrementalParses, 2)
+    assert.equal(reused.childIncrementalParses, 1)
     assert.equal(reused.childFullParses, 0)
+    assert.equal(reused.childTreeEditReuses, 1)
+    assert.equal(reused.childTreeEditFallbacks, 1)
     assert.equal(session.getDiagnostics().injectionChildBackendCount, 2)
   }
 

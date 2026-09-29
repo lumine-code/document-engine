@@ -493,7 +493,30 @@ test('parses HTML to JavaScript to TODO as nested native child layers', async ()
   assert.equal(afterEdit.failedInjectionLayerCount, 0)
   assert.equal(afterEdit.maximumInjectionDepth, 2)
   assert.ok(afterEdit.injectionReusedLayers >= 2)
-  assert.ok(afterEdit.injectionChildIncrementalParses >= 2)
+  assert.ok(afterEdit.injectionChildTreeEditReuses >= 2)
+  let todoIndex = buffer.getText().indexOf('TODO')
+  let todoPoint = buffer.positionForCharacterIndex(todoIndex)
+  let todoNode = session.getSyntaxNodeAtPosition(todoPoint)
+  assert.equal(todoNode.grammarId, 'text.todo')
+  assert.equal(todoNode.depth, 2)
+
+  const treeEditReuses = afterEdit.injectionChildTreeEditReuses
+  buffer.setTextInRange(
+    {start: {row: 0, column: 0}, end: {row: 0, column: 0}},
+    '\n',
+  )
+  await apply(session, buffer, 3, new Uint32Array([0, 0, 0, 0, 0, 0, 1, 0]))
+  const shifted = await bridge.synchronize()
+  assert.equal(shifted.accepted, true)
+  const afterPrefix = session.getDiagnostics()
+  assert.equal(afterPrefix.dynamicInjectionLayerCount, 2)
+  assert.equal(afterPrefix.maximumInjectionDepth, 2)
+  assert.ok(afterPrefix.injectionChildTreeEditReuses >= treeEditReuses + 2)
+  todoIndex = buffer.getText().indexOf('TODO')
+  todoPoint = buffer.positionForCharacterIndex(todoIndex)
+  todoNode = session.getSyntaxNodeAtPosition(todoPoint)
+  assert.equal(todoNode.grammarId, 'text.todo')
+  assert.equal(todoNode.depth, 2)
 
   bridge.destroy()
   await session.destroy()

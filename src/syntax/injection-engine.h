@@ -108,6 +108,8 @@ struct InjectionEngineDiagnostics {
   uint64_t projected_range_count = 0;
   uint64_t child_incremental_parse_count = 0;
   uint64_t child_full_parse_count = 0;
+  uint64_t child_tree_edit_reuse_count = 0;
+  uint64_t child_tree_edit_fallback_count = 0;
   uint64_t reuse_fallback_count = 0;
   uint64_t child_backend_count = 0;
 };

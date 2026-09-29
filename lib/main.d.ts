@@ -256,6 +256,8 @@ export interface DocumentSessionDiagnostics {
   injectionProjectedRanges: number
   injectionChildIncrementalParses: number
   injectionChildFullParses: number
+  injectionChildTreeEditReuses: number
+  injectionChildTreeEditFallbacks: number
   injectionReuseFallbacks: number
   injectionChildBackendCount: number
   syntaxInputTooLarge: number

@@ -2585,6 +2585,12 @@ Napi::Value DocumentSessionWrapper::get_diagnostics(
                  env, injections.child_incremental_parse_count));
   result.Set("injectionChildFullParses",
              Napi::Number::New(env, injections.child_full_parse_count));
+  result.Set("injectionChildTreeEditReuses",
+             Napi::Number::New(env,
+                               injections.child_tree_edit_reuse_count));
+  result.Set("injectionChildTreeEditFallbacks",
+             Napi::Number::New(
+                 env, injections.child_tree_edit_fallback_count));
   result.Set("injectionReuseFallbacks",
              Napi::Number::New(env, injections.reuse_fallback_count));
   result.Set("injectionChildBackendCount",
