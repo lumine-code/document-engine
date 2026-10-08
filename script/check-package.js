@@ -87,7 +87,8 @@ function checkNativeManifest() {
     }
   }
   for (const license of ['TREE-SITTER.txt', 'PCRE2.txt', 'WASMTIME.txt']) {
-    if (!fs.existsSync(path.join(packageRoot, 'licenses', license))) {
+    const combined = fs.readFileSync(path.join(packageRoot, 'LICENSE'), 'utf8')
+    if (!combined.includes(`Original file: licenses/${license}`)) {
       fail(`Missing bundled license: ${license}`)
     }
   }
@@ -137,8 +138,6 @@ function checkManifest() {
     'src',
     'script',
     'README.md',
-    'THIRD_PARTY_NOTICES.md',
-    'licenses',
     'LICENSE',
   ]) {
     if (!manifest.files?.includes(required)) fail(`files omits ${required}`)
@@ -202,9 +201,7 @@ function checkPack() {
     'script/cleanup-install-artifacts.js',
     'script/resolve-superstring-abi.js',
     'src/bindings/addon.cc',
-    'licenses/TREE-SITTER.txt',
-    'licenses/PCRE2.txt',
-    'licenses/WASMTIME.txt',
+    'LICENSE',
   ]) {
     if (!paths.has(required)) fail(`Packed archive omits ${required}`)
   }

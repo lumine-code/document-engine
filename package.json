@@ -13,8 +13,6 @@
     "script",
     "src",
     "README.md",
-    "THIRD_PARTY_NOTICES.md",
-    "licenses",
     "LICENSE"
   ],
   "scripts": {
